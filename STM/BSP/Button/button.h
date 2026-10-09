@@ -14,12 +14,23 @@ typedef struct Button Button;
 typedef struct Button_Config Button_Config;
 typedef struct Button_Ops Button_Ops;
 typedef enum Button_ActiveState Button_ActiveState;
+typedef enum Button_State Button_State;
 typedef enum Button_Error Button_Error;
 
 enum Button_ActiveState
 {
 	BUTTON_ACTIVE_LOW = GPIO_PIN_RESET,
 	BUTTON_ACTIVE_HIGH = GPIO_PIN_SET,
+};
+
+enum Button_State
+{
+	BUTTON_STATE_IDLE = 0,
+	BUTTON_STATE_DEBOUNCE_PRESS,
+	BUTTON_STATE_PRESSED,
+	BUTTON_STATE_DEBOUNCE_RELEASE,
+	BUTTON_STATE_WAIT_CLICK,
+	BUTTON_STATE_CLICKS_READY,
 };
 
 struct Button_Config
@@ -37,6 +48,8 @@ struct Button
 {
 	Button_Config config;
 
+	Button_State state;
+
 	bool pressed_raw_state;
 	bool pressed_state;
 	bool previous_pressed_state;
@@ -50,22 +63,24 @@ struct Button
 	const Button_Ops *ops;
 };
 
-struct Button_Ops
-{
-	bool (*is_pressed)(const Button *self);
-	bool (*is_pressed_with_delay)(const Button *self, uint32_t delay_ms);
-	bool (*is_clicked_times)(const Button *self, uint8_t times);
-	void (*update)(Button *self);
-};
-
 enum Button_Error
 {
 	BUTTON_ERROR_NONE = 0,
+	BUTTON_ERROR_NULLPTR,
 	BUTTON_ERROR_UNINITIALIZED_CONFIG,
 	BUTTON_ERROR_GPIO_PORT_NULLPTR,
 };
 
 DEFINE_RESULT(Button, Button_Error);
+DEFINE_RESULT(Button_State, Button_Error);
+
+struct Button_Ops
+{
+	bool (*is_pressed)(const Button *self);
+	bool (*is_pressed_with_delay)(const Button *self, uint32_t delay_ms);
+	bool (*is_clicked_times)(const Button *self, uint8_t times);
+	Result(Button_State, Button_Error) (*update)(Button *self);
+};
 
 Result(Button, Button_Error) Button_Init(const Button_Config *config);
 
@@ -75,7 +90,7 @@ bool Button_IsPressedWithDelay(const Button *self, uint32_t delay_ms);
 
 bool Button_IsClickedTimes(const Button *self, uint8_t times);
 
-void Button_Update(Button *self);
+Result(Button_State, Button_Error) Button_Update(Button *self);
 
 #ifdef __cplusplus
 }
