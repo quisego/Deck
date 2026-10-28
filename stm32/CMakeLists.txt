@@ -46,6 +46,7 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
     Common/Logger/logger.c
+    Common/Supervisor/supervisor.c
     Common/FSM/fsm.c
 )
 
@@ -55,6 +56,7 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     Common
     Common/Logger
     Common/FSM
+    Common/Supervisor
 )
 
 # Add project symbols (macros)
