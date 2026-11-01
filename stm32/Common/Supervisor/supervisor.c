@@ -1,6 +1,8 @@
 #include "supervisor.h"
 #include <stdatomic.h>
+#include <stdint.h>
 #include "logger.h"
+#include "portmacro.h"
 
 typedef struct {
 	TaskHandle_t 				handle;
@@ -56,6 +58,17 @@ static void log_reset_reason(void)
 	__HAL_RCC_CLEAR_RESET_FLAGS();
 }
 
+static void check_iwdg_timeout(uint32_t period_ms)
+{
+	const uint32_t divider = 4U << s_hiwdg->Init.Prescaler;
+	const uint32_t min_ms = (uint32_t)(((uint64_t)(s_hiwdg->Init.Reload + 1U) * divider * 1000U) / 47000U);
+
+	if (min_ms < (2U * period_ms))
+	{
+		LOG_E("supervisor: IWDG timeout is only %lu ms (worst case), need >= %lu ms. Raise the IWDG prescaler in CubeMX", (unsigned long)min_ms, (unsigned long)(2U * period_ms));
+	}
+}
+
 static bool check_tasks(void)
 {
 	bool is_all_ok = true;
@@ -77,7 +90,7 @@ static bool check_tasks(void)
 		{
 			is_all_ok = false;
 
-			LOG_E("supervisor: task '%s' silent for %lu ms", pcTaskGetName(t->handle), (unsigned long)(age * portTICK_PERIOD_MS));
+			LOG_E("supervisor: task '%s' silent for %lu ms (limit %lu ms)", pcTaskGetName(t->handle), (unsigned long)(age * portTICK_PERIOD_MS), (unsigned long)(t->timeout_ticks * portTICK_PERIOD_MS));
 		}
 	}
 
@@ -157,6 +170,7 @@ Result(SupervisorError, SupervisorError) Supervisor_Init(const SupervisorConfig 
 	s_stack_min_free = cfg->stack_min_free_words;
 
 	log_reset_reason();
+	check_iwdg_timeout(cfg->check_period_ms);
 	HAL_IWDG_Refresh(s_hiwdg);
 
 	if (xTaskCreate(supervisor_task, "Supervisor", cfg->task_stack_words, NULL, cfg->task_priority, NULL) != pdPASS)
@@ -176,7 +190,7 @@ SupervisorTaskID Supervisor_Register(TaskHandle_t task, uint32_t timeout_ms)
 		task = xTaskGetCurrentTaskHandle();
 	}
 
-	if ((task == NULL) || (timeout_ms = 0U))
+	if ((task == NULL) || (timeout_ms == 0U))
 	{
 		return SUPERVISOR_INVALID_ID;
 	}
