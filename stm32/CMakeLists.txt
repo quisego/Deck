@@ -48,6 +48,8 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Common/Logger/logger.c
     Common/Supervisor/supervisor.c
     Common/FSM/fsm.c
+
+    Cmd/AppTest/app_test.c
 )
 
 # Add include paths
@@ -57,6 +59,8 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     Common/Logger
     Common/FSM
     Common/Supervisor
+
+    Cmd/AppTest
 )
 
 # Add project symbols (macros)
