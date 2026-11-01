@@ -1,13 +1,29 @@
 #include "logger.h"
 #include "FreeRTOS.h"
+#include "portmacro.h"
+#include "projdefs.h"
 #include "queue.h"
 #include "task.h"
 #include <stdatomic.h>
 #include <stdarg.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
 #define LOGGER_MIN_MESSAGE_LENGTH 32U
+
+/*
+	Queue log event. ~40 bytes
+*/
+typedef struct {
+	const char 	*fmt;
+	const char 	*file;
+	uint32_t 		tick;
+	LogArg 			args[LOGGER_MAX_ARGS];
+	uint16_t 		line;
+	uint8_t 		level;
+} LogEvent;
 
 static UART_HandleTypeDef *s_huart;
 static QueueHandle_t 			s_queue;
@@ -20,23 +36,68 @@ static atomic_uint 				s_dropped;
  
 #define LOGGER_FAIL(err) RESULT_ERROR(LoggerError, LoggerError, (err))
 
+static uint32_t format_event(const LogEvent *e, char *out)
+{
+	const size_t limit = (size_t)s_max_len - 2U; // 2 bytes for "\r\n"
+	const char level_char = "DIWE"[e->level & 3U];
+
+	int n;
+
+	// prefix
+	if (e->file != NULL)
+	{
+		n = snprintf(out, limit, "[%lu] %c %s:%u: ", (unsigned long)e->tick, level_char, e->file, (unsigned)e->line);
+	}
+	else
+	{
+		n = snprintf(out, limit, "[%lu] %c: ", (unsigned long)e->tick, level_char);
+	}
+
+	size_t pos = (n < 0) ? 0U : (((size_t)n < limit) ? (size_t)n : (limit - 1U));
+
+	const size_t room = limit - pos;
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
+#pragma GCC diagnostic ignored "-Wformat-security"
+	
+	n = snprintf(&out[pos], room, e->fmt, e->args[0], e->args[1], e->args[2], e->args[3], e->args[4], e->args[5]);
+
+#pragma GCC diagnostic pop
+
+	if (n > 0)
+	{
+		pos += ((size_t)n < room) ? (size_t)n : (room - 1U);
+	}
+
+	out[pos++] = '\r';
+	out[pos++] = '\n';
+
+	return (uint32_t)pos;
+}
+
 static void process_queue(void)
 {
-	if (xQueueReceive(s_queue, s_tx_buf, portMAX_DELAY) != pdPASS)
+	LogEvent e;
+
+	// 1. Sleep while first event not apear
+	if (xQueueReceive(s_queue, &e, portMAX_DELAY) != pdPASS)
 	{
 		return;
 	}
 
-	uint32_t len = (uint32_t)strlen((const char *)s_tx_buf);
+	uint32_t len = format_event(&e, (char *)s_tx_buf);
 
+	// 2. Add all event from queue, while tx_buf has size for one more raw max length
 	while (
 		(len + s_max_len <= s_tx_size)
-		&& (xQueueReceive(s_queue, &s_tx_buf[len], 0) == pdPASS)
+		&& (xQueueReceive(s_queue, &e, 0) == pdPASS)
 	)
 	{
-		len += (uint32_t)strlen((const char *)&s_tx_buf[len]);
+		len += format_event(&e, (char *)&s_tx_buf[len]);
 	}
 
+	// 3. Clear old notification and start DMA
 	ulTaskNotifyTake(pdTRUE, 0);
 	
 	if (HAL_UART_Transmit_DMA(s_huart, s_tx_buf, (uint16_t)len) != HAL_OK)
@@ -44,8 +105,10 @@ static void process_queue(void)
 		return;
 	}
 
+	// 4. Wait signal form ISR.
 	const uint32_t wait_ms = (uint32_t)(((uint64_t)len * 12000U) / s_huart->Init.BaudRate) + 20U;
 
+	// If no signal, abort TX
 	if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(wait_ms)) == 0U)
 	{
 		HAL_UART_AbortTransmit(s_huart);
@@ -92,7 +155,7 @@ Result(LoggerError, LoggerError) Logger_Init(const LoggerConfig *cfg)
 
 	const uint32_t tx_size = (uint32_t)cfg->max_message_length * LOGGER_TX_BATCH;
 	uint8_t *tx_buf = (uint8_t *)pvPortMalloc(tx_size);
-	QueueHandle_t queue = xQueueCreate(cfg->queue_length, cfg->max_message_length);
+	QueueHandle_t queue = xQueueCreate(cfg->queue_length, sizeof(LogEvent));
 	if ((tx_buf == NULL) || (queue == NULL))
 	{
 		if (tx_buf != NULL)
@@ -126,7 +189,7 @@ Result(LoggerError, LoggerError) Logger_Init(const LoggerConfig *cfg)
 	return RESULT_OK(LoggerError, LoggerError, LOGGER_ERROR_NONE);
 }
 
-void Logger_Log(LogLevel level, const char *file, int line, const char *fmt, ...)
+void Logger_Log(LogLevel level, const char *file, int line, const char *fmt, LogArg a0, LogArg a1, LogArg a2, LogArg a3, LogArg a4, LogArg a5)
 {
 	if ((s_queue == NULL) || (level < s_min_level))
 	{
@@ -139,54 +202,25 @@ void Logger_Log(LogLevel level, const char *file, int line, const char *fmt, ...
 	}
 
 	const bool isISR = (__get_IPSR() != 0U);
-	const unsigned long tick = isISR ? (unsigned long)xTaskGetTickCountFromISR() : (unsigned long)xTaskGetTickCount();
-	const size_t cap = s_max_len;
-	const size_t limit = cap - 2U;
-
-	char msg[cap];
-
-	const char level_char = "DIWE"[level];
-	
-	int n;
-	if (file != NULL)
-	{
-		n = snprintf(msg, limit, "[%lu] %c %s:%d: ", tick, level_char, file, line);
-	}
-	else
-	{
-		n = snprintf(msg, limit, "[%lu] %c: ", tick, level_char);
-	}
-
-	size_t pos = (n < 0)
-		? 0U : (((size_t)n < limit)
-			? (size_t)n : (limit - 1U));
-	
-	const size_t room = limit - pos;
-	
-	va_list ap;
-	va_start(ap, fmt);
-	n = vsnprintf(&msg[pos], room, fmt, ap);
-	va_end(ap);
-
-	if (n > 0)
-	{
-		pos += ((size_t)n < room) ? (size_t)n : (room - 1U);
-	}
-
-	msg[pos++] = '\r';
-	msg[pos++] = '\n';
-	msg[pos] = '\0';
+	const LogEvent e = {
+		.fmt = fmt,
+		.file = file,
+		.tick = isISR ? (uint32_t)xTaskGetTickCountFromISR() : (uint32_t)xTaskGetTickCount(),
+		.args = {a0, a1, a2, a3, a4, a5},
+		.line = (uint16_t)line,
+		.level = (uint8_t)level,
+	};
 
 	BaseType_t ok;
 	if (isISR)
 	{
 		BaseType_t woken = pdFALSE;
-		ok = xQueueSendFromISR(s_queue, msg, &woken);
+		ok = xQueueSendFromISR(s_queue, &e, &woken);
 		portYIELD_FROM_ISR(woken);
 	}
 	else
 	{
-		ok = xQueueSend(s_queue, msg, 0);
+		ok = xQueueSend(s_queue, &e, 0);
 	}
 
 	if (ok != pdPASS)
