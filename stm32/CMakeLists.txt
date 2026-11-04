@@ -37,6 +37,9 @@ add_executable(${CMAKE_PROJECT_NAME})
 # Add STM32CubeMX generated sources
 add_subdirectory(cmake/stm32cubemx)
 
+# Shared protocol library (root/common/proto)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../common/proto ${CMAKE_BINARY_DIR}/proto)
+
 # Link directories setup
 target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined library search paths
@@ -48,6 +51,9 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Common/Logger/logger.c
     Common/Supervisor/supervisor.c
     Common/FSM/fsm.c
+    Common/Link/link.c
+
+    Cmd/App/app.c
 )
 
 # Add include paths
@@ -57,6 +63,9 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     Common/Logger
     Common/FSM
     Common/Supervisor
+    Common/Link
+
+    Cmd/App
 )
 
 # Add project symbols (macros)
@@ -72,4 +81,5 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
     stm32cubemx
 
     # Add user defined libraries
+    proto
 )
