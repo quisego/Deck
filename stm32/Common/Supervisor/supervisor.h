@@ -13,7 +13,7 @@ extern "C" {
 #endif
 
 #ifndef SUPERVISOR_MAX_TASKS
-#define SUPERVISOR_MAX_TASKS 8U
+#define SUPERVISOR_MAX_TASKS 16U
 #endif
 
 #define SUPERVISOR_INVALID_ID 0xFFU
