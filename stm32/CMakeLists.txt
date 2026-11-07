@@ -45,6 +45,8 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined library search paths
 )
 
+file(GLOB U8G2_SOURCES "ThirdParty/u8g2/*.c")
+
 # Add sources to executable
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
@@ -52,8 +54,15 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Common/Supervisor/supervisor.c
     Common/FSM/fsm.c
     Common/Link/link.c
+    Common/Memstat/mem_stat.c
 
     BSP/Button/button.c
+    BSP/ssd1306/ssd1306.c
+    BSP/bme280/bme280.c
+    BSP/ds1307/ds1307.c
+    BSP/I2C_BUS/i2c_bus.c
+
+    ${U8G2_SOURCES}
 
     Cmd/App/app.c
 )
@@ -66,8 +75,15 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     Common/FSM
     Common/Supervisor
     Common/Link
+    Common/Memstat
 
     BSP/Button
+    BSP/ssd1306
+    BSP/bme280
+    BSP/ds1307
+    BSP/I2C_BUS
+
+    ThirdParty/u8g2
 
     Cmd/App
 )

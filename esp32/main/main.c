@@ -11,18 +11,16 @@ static const char *TAG = "app";
 
 static Link g_link;
 
-/*
-	button_id = (індекс порту << 4) | номер піна (рахує STM32, див. Button_IdFromConfig).
-	Мають збігатися з пінами в app.c на STM32: PB0 -> 0x10, PB1 -> 0x11.
-*/
 #define BTN_ID_A 0x10U
 #define BTN_ID_B 0x11U
+
+#define SET_RTC_ON_BOOT 1
 
 typedef struct
 {
 	uint8_t id;
 	const char *name;
-	bool pressed; /* 1 - натиснута, 0 - відпущена */
+	bool pressed;
 } ButtonSlot;
 
 static ButtonSlot s_buttons[] = {
@@ -50,7 +48,6 @@ static void log_state(void)
 	ESP_LOGI(TAG, "A=%d B=%d", s_buttons[0].pressed ? 1 : 0, s_buttons[1].pressed ? 1 : 0);
 }
 
-/* Викликається з RX-задачі Link для всіх MSG_ID_BUTTON_* */
 static void on_button_message(const LinkMessage *msg, void *ctx)
 {
 	(void)ctx;
@@ -98,6 +95,67 @@ static void on_button_message(const LinkMessage *msg, void *ctx)
 	}
 }
 
+static void on_rtc_message(const LinkMessage *msg, void *ctx)
+{
+	(void)ctx;
+
+	ProtoRtcTime t;
+
+	if (ProtoMsg_DecodeRtcTime(msg->payload, msg->length, &t) != PROTOCOL_OK)
+	{
+		ESP_LOGW(TAG, "Bad RTC payload (len=%u)", (unsigned)msg->length);
+		return;
+	}
+
+	ESP_LOGI(TAG, "RTC: %04u-%02u-%02u (wd=%u) %02u:%02u:%02u",
+		(unsigned)t.year, (unsigned)t.month, (unsigned)t.date, (unsigned)t.weekday,
+		(unsigned)t.hours, (unsigned)t.minutes, (unsigned)t.seconds);
+}
+
+static void on_env_message(const LinkMessage *msg, void *ctx)
+{
+	(void)ctx;
+
+	ProtoEnvData e;
+
+	if (ProtoMsg_DecodeEnvData(msg->payload, msg->length, &e) != PROTOCOL_OK)
+	{
+		ESP_LOGW(TAG, "Bad ENV payload (len=%u)", (unsigned)msg->length);
+		return;
+	}
+
+	const int t = e.temperature_c_x100;
+	const int t_abs = (t < 0) ? -t : t;
+
+	ESP_LOGI(TAG, "ENV: T=%s%d.%02d C, RH=%u.%02u %%, P=%u.%02u hPa",
+		(t < 0) ? "-" : "", t_abs / 100, t_abs % 100,
+		(unsigned)(e.humidity_pct_x100 / 100U), (unsigned)(e.humidity_pct_x100 % 100U),
+		(unsigned)(e.pressure_pa / 100U), (unsigned)(e.pressure_pa % 100U));
+}
+
+static bool send_rtc_set(uint16_t year, uint8_t month, uint8_t date, uint8_t hours, uint8_t minutes, uint8_t seconds)
+{
+	const ProtoRtcTime t = {
+		.year = year,
+		.month = month,
+		.date = date,
+		.weekday = 0U,
+		.hours = hours,
+		.minutes = minutes,
+		.seconds = seconds,
+	};
+
+	uint8_t buf[PROTO_RTC_TIME_SIZE];
+	size_t len = 0U;
+
+	if (ProtoMsg_EncodeRtcTime(&t, buf, sizeof(buf), &len) != PROTOCOL_OK)
+	{
+		return false;
+	}
+
+	return Link_Send(&g_link, (uint16_t)MSG_ID_RTC_SET, buf, (uint16_t)len, pdMS_TO_TICKS(100)) == LINK_OK;
+}
+
 void app_main(void)
 {
   ESP_LOGI(TAG, "Initializing Link module...");
@@ -111,8 +169,8 @@ void app_main(void)
     .tx_buffer_size = 1024,
     .tx_queue_length = 8,
     .max_payload = 128,
-    .tx_task_stack_words = 4096, /* ESP-IDF: це БАЙТИ, не слова */
-    .rx_task_stack_words = 6144, /* callback-и (ESP_LOGI) виконуються в цій задачі */
+    .tx_task_stack_words = 4096,
+    .rx_task_stack_words = 6144,
     .tx_task_priority = 5,
     .rx_task_priority = 5,
     .tx_timeout_ticks = pdMS_TO_TICKS(100),
@@ -127,7 +185,6 @@ void app_main(void)
 
   ESP_LOGI(TAG, "Link module initialized successfully.");
 
-  /* Підписка на кожен ID окремо */
   for (uint16_t id = (uint16_t)PROTO_MSG_ID_BUTTON_FIRST; id <= (uint16_t)PROTO_MSG_ID_BUTTON_LAST; id++)
   {
     if (Link_Subscribe(&g_link, id, on_button_message, NULL) != LINK_OK)
@@ -136,7 +193,26 @@ void app_main(void)
     }
   }
 
-  ESP_LOGI(TAG, "Waiting for button events...");
+  if (Link_Subscribe(&g_link, (uint16_t)MSG_ID_RTC_TIME, on_rtc_message, NULL) != LINK_OK)
+  {
+    ESP_LOGE(TAG, "Failed to subscribe to RTC_TIME");
+  }
+
+  if (Link_Subscribe(&g_link, (uint16_t)MSG_ID_ENV_DATA, on_env_message, NULL) != LINK_OK)
+  {
+    ESP_LOGE(TAG, "Failed to subscribe to ENV_DATA");
+  }
+
+#if SET_RTC_ON_BOOT
+  if (!send_rtc_set(2026, 11, 7, 12, 0, 0))
+  {
+    ESP_LOGE(TAG, "Failed to send RTC set");
+  }
+#else
+  (void)send_rtc_set;
+#endif
+
+  ESP_LOGI(TAG, "Waiting for events...");
 
   while (1)
   {
