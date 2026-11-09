@@ -4,6 +4,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "bridge.h"
 #include "link.h"
 #include "msg.h"
 
@@ -13,8 +14,6 @@ static Link g_link;
 
 #define BTN_ID_A 0x10U
 #define BTN_ID_B 0x11U
-
-#define SET_RTC_ON_BOOT 1
 
 typedef struct
 {
@@ -93,6 +92,8 @@ static void on_button_message(const LinkMessage *msg, void *ctx)
 	default:
 		break;
 	}
+
+	Bridge_OnButton(msg->id, slot->name, &ev);
 }
 
 static void on_rtc_message(const LinkMessage *msg, void *ctx)
@@ -107,9 +108,11 @@ static void on_rtc_message(const LinkMessage *msg, void *ctx)
 		return;
 	}
 
-	ESP_LOGI(TAG, "RTC: %04u-%02u-%02u (wd=%u) %02u:%02u:%02u",
+	ESP_LOGD(TAG, "RTC: %04u-%02u-%02u (wd=%u) %02u:%02u:%02u",
 		(unsigned)t.year, (unsigned)t.month, (unsigned)t.date, (unsigned)t.weekday,
 		(unsigned)t.hours, (unsigned)t.minutes, (unsigned)t.seconds);
+
+	Bridge_OnRtc(&t);
 }
 
 static void on_env_message(const LinkMessage *msg, void *ctx)
@@ -131,29 +134,37 @@ static void on_env_message(const LinkMessage *msg, void *ctx)
 		(t < 0) ? "-" : "", t_abs / 100, t_abs % 100,
 		(unsigned)(e.humidity_pct_x100 / 100U), (unsigned)(e.humidity_pct_x100 % 100U),
 		(unsigned)(e.pressure_pa / 100U), (unsigned)(e.pressure_pa % 100U));
+
+	Bridge_OnEnv(&e);
 }
 
-static bool send_rtc_set(uint16_t year, uint8_t month, uint8_t date, uint8_t hours, uint8_t minutes, uint8_t seconds)
+static void on_status_message(const LinkMessage *msg, void *ctx)
 {
-	const ProtoRtcTime t = {
-		.year = year,
-		.month = month,
-		.date = date,
-		.weekday = 0U,
-		.hours = hours,
-		.minutes = minutes,
-		.seconds = seconds,
-	};
+	(void)ctx;
 
-	uint8_t buf[PROTO_RTC_TIME_SIZE];
-	size_t len = 0U;
+	ProtoSysStatus s;
 
-	if (ProtoMsg_EncodeRtcTime(&t, buf, sizeof(buf), &len) != PROTOCOL_OK)
+	if (ProtoMsg_DecodeSysStatus(msg->payload, msg->length, &s) != PROTOCOL_OK)
 	{
-		return false;
+		ESP_LOGW(TAG, "Bad STATUS payload (len=%u)", (unsigned)msg->length);
+		return;
 	}
 
-	return Link_Send(&g_link, (uint16_t)MSG_ID_RTC_SET, buf, (uint16_t)len, pdMS_TO_TICKS(100)) == LINK_OK;
+	ESP_LOGI(TAG, "STM32: up %u s, heap free %u (min %u), oled=%d rtc=%d bme=%d",
+		(unsigned)(s.uptime_ms / 1000U), (unsigned)s.heap_free, (unsigned)s.heap_min,
+		(s.flags & PROTO_STATUS_FLAG_OLED) ? 1 : 0,
+		(s.flags & PROTO_STATUS_FLAG_RTC) ? 1 : 0,
+		(s.flags & PROTO_STATUS_FLAG_BME) ? 1 : 0);
+
+	Bridge_OnStmStatus(&s);
+}
+
+static void subscribe(uint16_t id, void (*cb)(const LinkMessage *msg, void *ctx))
+{
+	if (Link_Subscribe(&g_link, id, cb, NULL) != LINK_OK)
+	{
+		ESP_LOGE(TAG, "Failed to subscribe to message 0x%04x", (unsigned)id);
+	}
 }
 
 void app_main(void)
@@ -185,32 +196,16 @@ void app_main(void)
 
   ESP_LOGI(TAG, "Link module initialized successfully.");
 
+  Bridge_Init(&g_link);
+
   for (uint16_t id = (uint16_t)PROTO_MSG_ID_BUTTON_FIRST; id <= (uint16_t)PROTO_MSG_ID_BUTTON_LAST; id++)
   {
-    if (Link_Subscribe(&g_link, id, on_button_message, NULL) != LINK_OK)
-    {
-      ESP_LOGE(TAG, "Failed to subscribe to message 0x%04x", (unsigned)id);
-    }
+    subscribe(id, on_button_message);
   }
 
-  if (Link_Subscribe(&g_link, (uint16_t)MSG_ID_RTC_TIME, on_rtc_message, NULL) != LINK_OK)
-  {
-    ESP_LOGE(TAG, "Failed to subscribe to RTC_TIME");
-  }
-
-  if (Link_Subscribe(&g_link, (uint16_t)MSG_ID_ENV_DATA, on_env_message, NULL) != LINK_OK)
-  {
-    ESP_LOGE(TAG, "Failed to subscribe to ENV_DATA");
-  }
-
-#if SET_RTC_ON_BOOT
-  if (!send_rtc_set(2026, 11, 7, 12, 0, 0))
-  {
-    ESP_LOGE(TAG, "Failed to send RTC set");
-  }
-#else
-  (void)send_rtc_set;
-#endif
+  subscribe((uint16_t)MSG_ID_RTC_TIME, on_rtc_message);
+  subscribe((uint16_t)MSG_ID_ENV_DATA, on_env_message);
+  subscribe((uint16_t)MSG_ID_SYS_STATUS, on_status_message);
 
   ESP_LOGI(TAG, "Waiting for events...");
 

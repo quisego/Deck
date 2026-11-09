@@ -312,6 +312,7 @@ static void bme280_task(void *arg)
 
 static const BME280_Ops bme280_ops = {
 	.get_last = BME280_GetLast,
+	.is_online = BME280_IsOnline,
 };
 
 Result(BME280, BME280_Error) BME280_Init(const BME280_Config *config)
@@ -387,4 +388,11 @@ void BME280_FormatHumidity(const ProtoEnvData *data, char *buf, size_t size)
 void BME280_FormatPressure(const ProtoEnvData *data, char *buf, size_t size)
 {
 	(void)snprintf(buf, size, "P: %lu hPa", (unsigned long)((data->pressure_pa + 50U) / 100U));
+}
+
+bool BME280_IsOnline(const BME280 *self)
+{
+	(void)self;
+
+	return s_rt.in_use && s_rt.calibrated;
 }

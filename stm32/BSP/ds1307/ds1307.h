@@ -60,6 +60,7 @@ struct DS1307_Ops
 {
 	bool (*get_last)(const DS1307 *self, ProtoRtcTime *out);
 	DS1307_Error (*set_time)(const DS1307 *self, const ProtoRtcTime *time);
+	bool (*is_online)(const DS1307 *self);
 };
 
 typedef void (*DS1307_EventCallback)(uint16_t message_id, const ProtoRtcTime *time, void *ctx);
@@ -74,6 +75,8 @@ DS1307_Error DS1307_SetTime(const DS1307 *self, const ProtoRtcTime *time);
 
 void DS1307_TimeFormat(const ProtoRtcTime *time, char *buf, size_t size);
 void DS1307_DateFormat(const ProtoRtcTime *time, char *buf, size_t size);
+
+bool DS1307_IsOnline(const DS1307 *self);
 
 #ifdef __cplusplus
 }

@@ -16,6 +16,7 @@ typedef enum
 
 	MSG_ID_SYS_PING = 0x0001,
 	MSG_ID_SYS_PONG = 0x0002,
+	MSG_ID_SYS_STATUS = 0x0003, /* STM32 -> ESP32 */
 
 	MSG_ID_BUTTON_PRESSED = 0x0101,
 	MSG_ID_BUTTON_RELEASED = 0x0102,
@@ -94,6 +95,25 @@ typedef struct
 
 ProtocolStatus ProtoMsg_EncodeEnvData(const ProtoEnvData *in, uint8_t *out, size_t out_size, size_t *out_length);
 ProtocolStatus ProtoMsg_DecodeEnvData(const uint8_t *data, size_t length, ProtoEnvData *out);
+
+/* ---- System status (MSG_ID_SYS_STATUS) ---- */
+
+#define PROTO_SYS_STATUS_SIZE 16U
+
+#define PROTO_STATUS_FLAG_OLED (1UL << 0)
+#define PROTO_STATUS_FLAG_RTC  (1UL << 1)
+#define PROTO_STATUS_FLAG_BME  (1UL << 2)
+
+typedef struct
+{
+	uint32_t uptime_ms;
+	uint32_t heap_free;
+	uint32_t heap_min;
+	uint32_t flags;
+} ProtoSysStatus;
+
+ProtocolStatus ProtoMsg_EncodeSysStatus(const ProtoSysStatus *in, uint8_t *out, size_t out_size, size_t *out_length);
+ProtocolStatus ProtoMsg_DecodeSysStatus(const uint8_t *data, size_t length, ProtoSysStatus *out);
 
 #ifdef __cplusplus
 }

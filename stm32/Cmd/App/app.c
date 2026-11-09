@@ -15,7 +15,6 @@
 #include "stm32f4xx_hal_uart.h"
 #include "supervisor.h"
 #include "task.h"
-#include "mem_stat.h"
 
 #define LOGGER_TASK_PRIORITY (tskIDLE_PRIORITY + 1U)
 #define LINK_TASK_PRIORITY (tskIDLE_PRIORITY + 2U)
@@ -42,6 +41,10 @@ static Button g_button_b;
 static SSD1306 g_oled;
 static DS1307 g_rtc;
 static BME280 g_bme;
+
+/* ------------------------------------------------------------------ */
+/* Buttons                                                             */
+/* ------------------------------------------------------------------ */
 
 static void on_button_event(uint16_t message_id, const ProtoButtonEvent *event, void *ctx)
 {
@@ -89,6 +92,10 @@ static bool app_button_init(Button *out, GPIO_TypeDef *port, uint16_t pin)
 	return true;
 }
 
+/* ------------------------------------------------------------------ */
+/* RTC: every second -> OLED + ESP32                                  */
+/* ------------------------------------------------------------------ */
+
 static void on_rtc_event(uint16_t message_id, const ProtoRtcTime *time, void *ctx)
 {
 	(void)ctx;
@@ -116,6 +123,7 @@ static void on_rtc_event(uint16_t message_id, const ProtoRtcTime *time, void *ct
 	}
 }
 
+/* ESP32 -> STM32: DS1307 */
 static void on_rtc_set_message(const LinkMessage *msg, void *ctx)
 {
 	(void)ctx;
@@ -139,6 +147,10 @@ static void on_rtc_set_message(const LinkMessage *msg, void *ctx)
 	LOG_I("RTC set: %04u-%02u-%02u %02u:%02u:%02u", (unsigned)time.year, (unsigned)time.month, (unsigned)time.date,
 		(unsigned)time.hours, (unsigned)time.minutes, (unsigned)time.seconds);
 }
+
+/* ------------------------------------------------------------------ */
+/* BME280: -> OLED + ESP32                      							        */
+/* ------------------------------------------------------------------ */
 
 static void on_env_event(uint16_t message_id, const ProtoEnvData *data, void *ctx)
 {
@@ -169,6 +181,47 @@ static void on_env_event(uint16_t message_id, const ProtoEnvData *data, void *ct
 		LOG_W("ENV message dropped.");
 	}
 }
+
+/* ------------------------------------------------------------------ */
+/* STM32 -> ESP32																					            */
+/* ------------------------------------------------------------------ */
+
+#define STATUS_PERIOD_MS 5000U
+#define STATUS_TASK_STACK_WORDS 320U
+
+static void status_task(void *arg)
+{
+	(void)arg;
+
+	for (;;)
+	{
+		const ProtoSysStatus status = {
+			.uptime_ms = HAL_GetTick(),
+			.heap_free = (uint32_t)xPortGetFreeHeapSize(),
+			.heap_min = (uint32_t)xPortGetMinimumEverFreeHeapSize(),
+			.flags = (SSD1306_IsOnline(&g_oled) ? PROTO_STATUS_FLAG_OLED : 0UL)
+				| (DS1307_IsOnline(&g_rtc) ? PROTO_STATUS_FLAG_RTC : 0UL)
+				| (BME280_IsOnline(&g_bme) ? PROTO_STATUS_FLAG_BME : 0UL),
+		};
+
+		uint8_t buf[PROTO_SYS_STATUS_SIZE];
+		size_t len = 0U;
+
+		if (ProtoMsg_EncodeSysStatus(&status, buf, sizeof(buf), &len) == PROTOCOL_OK)
+		{
+			if (Link_Send(&g_link, (uint16_t)MSG_ID_SYS_STATUS, buf, (uint16_t)len, 0) != LINK_OK)
+			{
+				LOG_W("Status message dropped.");
+			}
+		}
+
+		vTaskDelay(pdMS_TO_TICKS(STATUS_PERIOD_MS));
+	}
+}
+
+/* ------------------------------------------------------------------ */
+/* Init                                                                */
+/* ------------------------------------------------------------------ */
 
 static void app_sensors_init(const AppConfig *cfg)
 {
@@ -254,7 +307,6 @@ void App_Init(const AppConfig *cfg)
 	const Result(LoggerError, LoggerError) logger_result = Logger_Init(&logger_cfg);
 	if (logger_result.is_error)
 	{
-		return;
 	}
 
 	LOG_I("Logger is initialized.");
@@ -308,11 +360,15 @@ void App_Init(const AppConfig *cfg)
 
 	app_sensors_init(cfg);
 
-	if (!MemStat_Start(10000U))
+	if (xTaskCreate(status_task, "status", STATUS_TASK_STACK_WORDS, NULL, tskIDLE_PRIORITY + 1U, NULL) != pdPASS)
 	{
-		LOG_E("Memory statistic task create failed.");
+		LOG_E("Status task create failed.");
 	}
 }
+
+/* ------------------------------------------------------------------ */
+/* HAL callbacks                                                       */
+/* ------------------------------------------------------------------ */
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {

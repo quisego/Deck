@@ -1,0 +1,51 @@
+menu "App Configuration"
+
+	config APP_WIFI_SSID
+		string "WiFi SSID"
+		default "my_wifi"
+
+	config APP_WIFI_PASSWORD
+		string "WiFi password"
+		default ""
+
+	config APP_MQTT_URI
+		string "MQTT broker URI"
+		default "mqtt://192.168.1.10:1883"
+		help
+			mqtt://host:1883 or mqtts://host:8883
+
+	config APP_MQTT_USER
+		string "MQTT username (no username = without authorization)"
+		default ""
+
+	config APP_MQTT_PASSWORD
+		string "MQTT password"
+		default ""
+
+	config APP_MQTT_CLIENT_ID
+		string "MQTT client id"
+		default "stm32-bridge"
+
+	config APP_MQTT_BASE_TOPIC
+		string "Basic topic"
+		default "stm32bridge"
+
+	config APP_MQTT_RTC_PERIOD_S
+		int "How often to post time RTC, seconds"
+		range 1 3600
+		default 10
+
+	config APP_STM_TIMEOUT_S
+		int "After how many seconds of silence STM32 is offline"
+		range 5 600
+		default 30
+
+	config APP_TZ
+		string "Timezone (POSIX TZ)"
+		default "EET-2EEST,M3.5.0/3,M10.5.0/4"
+
+	config APP_RTC_SYNC_ON_SNTP
+		bool "Write time from SNTP in DS1307 (STM32) after every sync"
+		default y
+
+endmenu

@@ -165,3 +165,39 @@ ProtocolStatus ProtoMsg_DecodeEnvData(const uint8_t *data, size_t length, ProtoE
 	out->pressure_pa = get_u32(&data[4]);
 	return PROTOCOL_OK;
 }
+
+/* ---- System status ---- */
+
+ProtocolStatus ProtoMsg_EncodeSysStatus(const ProtoSysStatus *in, uint8_t *out, size_t out_size, size_t *out_length)
+{
+	if ((in == NULL) || (out == NULL) || (out_length == NULL))
+	{
+		return PROTOCOL_INVALID_ARG;
+	}
+	if (out_size < PROTO_SYS_STATUS_SIZE)
+	{
+		return PROTOCOL_BUFFER_TOO_SMALL;
+	}
+
+	put_u32(&out[0], in->uptime_ms);
+	put_u32(&out[4], in->heap_free);
+	put_u32(&out[8], in->heap_min);
+	put_u32(&out[12], in->flags);
+
+	*out_length = PROTO_SYS_STATUS_SIZE;
+	return PROTOCOL_OK;
+}
+
+ProtocolStatus ProtoMsg_DecodeSysStatus(const uint8_t *data, size_t length, ProtoSysStatus *out)
+{
+	if ((data == NULL) || (out == NULL) || (length != PROTO_SYS_STATUS_SIZE))
+	{
+		return PROTOCOL_INVALID_ARG;
+	}
+
+	out->uptime_ms = get_u32(&data[0]);
+	out->heap_free = get_u32(&data[4]);
+	out->heap_min = get_u32(&data[8]);
+	out->flags = get_u32(&data[12]);
+	return PROTOCOL_OK;
+}

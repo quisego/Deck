@@ -51,6 +51,7 @@ DEFINE_RESULT(BME280, BME280_Error);
 struct BME280_Ops
 {
 	bool (*get_last)(const BME280 *self, ProtoEnvData *out);
+	bool (*is_online)(const BME280 *self);
 };
 
 typedef void (*BME280_EventCallback)(uint16_t message_id, const ProtoEnvData *data, void *ctx);
@@ -64,6 +65,8 @@ bool BME280_GetLast(const BME280 *self, ProtoEnvData *out);
 void BME280_FormatTemperature(const ProtoEnvData *data, char *buf, size_t size);
 void BME280_FormatHumidity(const ProtoEnvData *data, char *buf, size_t size);
 void BME280_FormatPressure(const ProtoEnvData *data, char *buf, size_t size);
+
+bool BME280_IsOnline(const BME280 *self);
 
 #ifdef __cplusplus
 }

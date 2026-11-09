@@ -260,6 +260,7 @@ static void ds1307_task(void *arg)
 static const DS1307_Ops ds1307_ops = {
 	.get_last = DS1307_GetLast,
 	.set_time = DS1307_SetTime,
+	.is_online = DS1307_IsOnline,
 };
 
 Result(DS1307, DS1307_Error) DS1307_Init(const DS1307_Config *config)
@@ -367,4 +368,11 @@ void DS1307_DateFormat(const ProtoRtcTime *time, char *buf, size_t size)
 	const char *wd = (time->weekday >= 1U && time->weekday <= 7U) ? WEEKDAY[time->weekday] : WEEKDAY[0];
 
 	(void)snprintf(buf, size, "%s %02u.%02u.%04u", wd, (unsigned)time->date, (unsigned)time->month, (unsigned)time->year);
+}
+
+bool DS1307_IsOnline(const DS1307 *self)
+{
+	(void)self;
+
+	return s_rt.in_use && s_rt.online;
 }
