@@ -1,3 +1,8 @@
+/*
+*	Driver for the BME280 sensor (temperature, humidity, pressure) over SPI.
+*	One task measures in a loop. When the values change enough, it calls the event callback.
+*/
+
 #include "bme280.h"
 #include "FreeRTOS.h"
 #include "task.h"
@@ -12,6 +17,10 @@
 #define BME280_MEASURE_DELAY_MS   12U
 #define BME280_MAX_FAILURES       3U
 
+/*
+*	Calibration numbers. Every chip has its own numbers stored inside.
+*	We read them once and use them in the formulas from the datasheet.
+*/
 typedef struct
 {
 	uint16_t dig_T1;
@@ -25,6 +34,9 @@ typedef struct
 	int8_t dig_H6;
 } BME280_Calib;
 
+/*
+*	Internal state of the driver.
+*/
 typedef struct
 {
 	BME280 sensor;
@@ -40,10 +52,16 @@ typedef struct
 	volatile SupervisorTaskID supervisor_id;
 } BME280_Runtime;
 
+/*
+*	Only ONE sensor is supported (one static object).
+*/
 static BME280_Runtime s_rt;
 static BME280_EventCallback s_event_cb;
 static void *s_event_ctx;
 
+/*
+*	CS = chip select. LOW means "talk to this chip". HIGH means "chip is free".
+*/
 static void cs_low(const BME280_Config *c)
 {
 	HAL_GPIO_WritePin(c->cs_port, c->cs_pin, GPIO_PIN_RESET);
@@ -54,6 +72,10 @@ static void cs_high(const BME280_Config *c)
 	HAL_GPIO_WritePin(c->cs_port, c->cs_pin, GPIO_PIN_SET);
 }
 
+/*
+*	Read registers over SPI. Bit 7 = 1 in the address means "read".
+*	We send zeros, and the chip answers at the same time.
+*/
 static HAL_StatusTypeDef read_regs(const BME280_Config *c, uint8_t reg, uint8_t *out, uint8_t len)
 {
 	uint8_t tx[27] = { 0 };
@@ -72,12 +94,16 @@ static HAL_StatusTypeDef read_regs(const BME280_Config *c, uint8_t reg, uint8_t 
 
 	if (status == HAL_OK)
 	{
+		// The first answer byte is junk (it came while we sent the address). Skip it.
 		memcpy(out, &rx[1], len);
 	}
 
 	return status;
 }
 
+/*
+*	Bit 7 = 0 in the address means "write".
+*/
 static HAL_StatusTypeDef write_reg(const BME280_Config *c, uint8_t reg, uint8_t value)
 {
 	uint8_t tx[2] = { (uint8_t)(reg & 0x7FU), value };
@@ -94,6 +120,11 @@ static uint16_t u16_le(const uint8_t *b)
 	return (uint16_t)((uint16_t)b[0] | (uint16_t)((uint16_t)b[1] << 8));
 }
 
+/*
+*	The next three functions are the official integer formulas from the Bosch datasheet.
+*	They turn raw ADC numbers into real values.
+*	Temperature result: degrees C * 100. t_fine is saved because pressure and humidity need it.
+*/
 static int32_t compensate_temperature(BME280_Runtime *rt, int32_t adc_t)
 {
 	const BME280_Calib *c = &rt->calib;
@@ -107,6 +138,9 @@ static int32_t compensate_temperature(BME280_Runtime *rt, int32_t adc_t)
 	return (rt->t_fine * 5 + 128) >> 8;
 }
 
+/*
+*	Pressure result: Pascal (Pa).
+*/
 static uint32_t compensate_pressure(const BME280_Runtime *rt, int32_t adc_p)
 {
 	const BME280_Calib *c = &rt->calib;
@@ -141,6 +175,9 @@ static uint32_t compensate_pressure(const BME280_Runtime *rt, int32_t adc_p)
 	return p;
 }
 
+/*
+*	Humidity result: %RH * 100.
+*/
 static uint16_t compensate_humidity(const BME280_Runtime *rt, int32_t adc_h)
 {
 	const BME280_Calib *c = &rt->calib;
@@ -165,6 +202,9 @@ static uint16_t compensate_humidity(const BME280_Runtime *rt, int32_t adc_h)
 	return (uint16_t)((q22_10 * 100U) / 1024U);
 }
 
+/*
+*	Check the chip id, reset the chip, and read the calibration numbers.
+*/
 static bool sensor_init(BME280_Runtime *rt)
 {
 	const BME280_Config *cfg = &rt->sensor.config;
@@ -187,6 +227,7 @@ static bool sensor_init(BME280_Runtime *rt)
 
 	BME280_Calib *c = &rt->calib;
 
+	// Unpack the calibration numbers from the raw bytes.
 	c->dig_T1 = u16_le(&buf_tp[0]);
 	c->dig_T2 = (int16_t)u16_le(&buf_tp[2]);
 	c->dig_T3 = (int16_t)u16_le(&buf_tp[4]);
@@ -202,6 +243,7 @@ static bool sensor_init(BME280_Runtime *rt)
 	c->dig_H1 = buf_tp[25];
 	c->dig_H2 = (int16_t)u16_le(&buf_h[0]);
 	c->dig_H3 = buf_h[2];
+	// H4 and H5 are 12-bit numbers that share one byte, so the unpacking is special.
 	c->dig_H4 = (int16_t)(((int32_t)(int8_t)buf_h[3] * 16) | (int32_t)(buf_h[4] & 0x0FU));
 	c->dig_H5 = (int16_t)(((int32_t)(int8_t)buf_h[5] * 16) | (int32_t)(buf_h[4] >> 4));
 	c->dig_H6 = (int8_t)buf_h[6];
@@ -209,17 +251,21 @@ static bool sensor_init(BME280_Runtime *rt)
 	return true;
 }
 
+/*
+*	Make one measurement and fill "out".
+*/
 static bool measure(BME280_Runtime *rt, ProtoEnvData *out)
 {
 	const BME280_Config *cfg = &rt->sensor.config;
 	uint8_t raw[8];
 
-	/* forced mode: osrs_h x1, osrs_t x1, osrs_p x1 */
+	// Forced mode: the chip measures one time and then goes to sleep (saves power).
 	if (write_reg(cfg, 0xF2, 0x01) != HAL_OK || write_reg(cfg, 0xF4, 0x25) != HAL_OK)
 	{
 		return false;
 	}
 
+	// Wait until the measurement is done.
 	vTaskDelay(pdMS_TO_TICKS(BME280_MEASURE_DELAY_MS));
 
 	if (read_regs(cfg, 0xF7, raw, sizeof(raw)) != HAL_OK)
@@ -227,17 +273,21 @@ static bool measure(BME280_Runtime *rt, ProtoEnvData *out)
 		return false;
 	}
 
+	// Read 8 bytes and build the raw numbers: pressure (20 bits), temperature (20 bits), humidity (16 bits).
 	const int32_t adc_p = ((int32_t)raw[0] << 12) | ((int32_t)raw[1] << 4) | (int32_t)(raw[2] >> 4);
 	const int32_t adc_t = ((int32_t)raw[3] << 12) | ((int32_t)raw[4] << 4) | (int32_t)(raw[5] >> 4);
 	const int32_t adc_h = ((int32_t)raw[6] << 8) | (int32_t)raw[7];
 
-	out->temperature_c_x100 = (int16_t)compensate_temperature(rt, adc_t); /* спочатку T: оновлює t_fine */
+	out->temperature_c_x100 = (int16_t)compensate_temperature(rt, adc_t);
 	out->pressure_pa = compensate_pressure(rt, adc_p);
 	out->humidity_pct_x100 = compensate_humidity(rt, adc_h);
 
 	return true;
 }
 
+/*
+*	True if any value changed by at least its step. We use this to avoid sending the same data again.
+*/
 static bool changed_enough(const BME280_Config *c, const ProtoEnvData *a, const ProtoEnvData *b)
 {
 	const int32_t dt = abs((int32_t)a->temperature_c_x100 - (int32_t)b->temperature_c_x100);
@@ -255,6 +305,9 @@ void BME280_SetEventCallback(BME280_EventCallback callback, void *ctx)
 	s_event_ctx = ctx;
 }
 
+/*
+*	Main loop: init if needed -> measure -> send if changed -> check in -> sleep.
+*/
 static void bme280_task(void *arg)
 {
 	BME280_Runtime *rt = (BME280_Runtime *)arg;
@@ -268,6 +321,7 @@ static void bme280_task(void *arg)
 
 	for (;;)
 	{
+		// Not ready? Try to init the sensor again. This also helps after a sensor error.
 		if (!rt->calibrated)
 		{
 			rt->calibrated = sensor_init(rt);
@@ -281,8 +335,10 @@ static void bme280_task(void *arg)
 			{
 				rt->failures = 0U;
 
+				// Send the first value always. After that, send only if the change is big enough.
 				if (!rt->has_last || changed_enough(cfg, &now, &rt->last))
 				{
+					// Critical section: other tasks cannot read "last" while it is half-written.
 					taskENTER_CRITICAL();
 					rt->last = now;
 					rt->has_last = true;
@@ -294,6 +350,7 @@ static void bme280_task(void *arg)
 					}
 				}
 			}
+			// After several failed measurements in a row, mark the sensor as "not ready" and init it again.
 			else if (++rt->failures >= BME280_MAX_FAILURES)
 			{
 				rt->calibrated = false;
@@ -301,6 +358,7 @@ static void bme280_task(void *arg)
 			}
 		}
 
+		// Tell the supervisor: "I am alive".
 		if (rt->supervisor_id != SUPERVISOR_INVALID_ID)
 		{
 			Supervisor_CheckIn(rt->supervisor_id);
@@ -315,6 +373,9 @@ static const BME280_Ops bme280_ops = {
 	.is_online = BME280_IsOnline,
 };
 
+/*
+*	Start the driver: check config, create the task, register in the supervisor.
+*/
 Result(BME280, BME280_Error) BME280_Init(const BME280_Config *config)
 {
 	if (config == NULL)
@@ -327,6 +388,7 @@ Result(BME280, BME280_Error) BME280_Init(const BME280_Config *config)
 		return RESULT_ERROR(BME280, BME280_Error, BME280_ERROR_INVALID_CONFIG);
 	}
 
+	// Already started? Return the same object.
 	if (s_rt.in_use)
 	{
 		return RESULT_OK(BME280, BME280_Error, s_rt.sensor);
@@ -350,11 +412,15 @@ Result(BME280, BME280_Error) BME280_Init(const BME280_Config *config)
 		return RESULT_ERROR(BME280, BME280_Error, BME280_ERROR_TASK_CREATE_FAILED);
 	}
 
+	// The task may be silent for 2 periods + 2 seconds before the supervisor complains.
 	s_rt.supervisor_id = Supervisor_Register(handle, config->period_ms * 2U + 2000U);
 
 	return RESULT_OK(BME280, BME280_Error, s_rt.sensor);
 }
 
+/*
+*	Get the last value we have. Returns false if there is no value yet.
+*/
 bool BME280_GetLast(const BME280 *self, ProtoEnvData *out)
 {
 	(void)self;
@@ -371,9 +437,13 @@ bool BME280_GetLast(const BME280 *self, ProtoEnvData *out)
 	return true;
 }
 
+/*
+*	The next functions make text for the OLED. They round the values.
+*/
 void BME280_FormatTemperature(const ProtoEnvData *data, char *buf, size_t size)
 {
 	const int32_t t = data->temperature_c_x100;
+	// Round to 0.1 degree.
 	const int32_t t10 = (t >= 0) ? ((t + 5) / 10) : ((t - 5) / 10);
 	const int32_t a = abs(t10);
 
@@ -385,11 +455,17 @@ void BME280_FormatHumidity(const ProtoEnvData *data, char *buf, size_t size)
 	(void)snprintf(buf, size, "RH: %u %%", (unsigned)((data->humidity_pct_x100 + 50U) / 100U));
 }
 
+/*
+*	Pa -> hPa (divide by 100).
+*/
 void BME280_FormatPressure(const ProtoEnvData *data, char *buf, size_t size)
 {
 	(void)snprintf(buf, size, "P: %lu hPa", (unsigned long)((data->pressure_pa + 50U) / 100U));
 }
 
+/*
+*	True when the sensor was found and calibrated.
+*/
 bool BME280_IsOnline(const BME280 *self)
 {
 	(void)self;

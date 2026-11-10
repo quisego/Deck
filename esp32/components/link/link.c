@@ -1,6 +1,15 @@
+/*
+*	Link (ESP32 version). Same idea and same API as the STM32 link.c,
+*	but here we use the ESP-IDF UART driver. The driver does buffering for us,
+*	so we do not need DMA code or a ring buffer.
+*/
+
 #include "link.h"
 #include <string.h>
 
+/*
+*	One TX slot: id, length, then the payload bytes.
+*/
 typedef struct
 {
 	uint16_t id;
@@ -10,6 +19,9 @@ typedef struct
 
 #define TX_SLOT_HEADER_SIZE ((uint16_t)sizeof(LinkTxSlot))
 
+/*
+*	Mutex helpers for statistics and the subscriber list.
+*/
 static void link_tx_task(void *arg);
 static void link_rx_task(void *arg);
 
@@ -29,6 +41,9 @@ static LinkTxSlot *tx_slot(Link *link, uint16_t index)
 	return (LinkTxSlot *)(void *)(link->tx_pool + ((size_t)index * link->tx_slot_size));
 }
 
+/*
+*	Start the link: set up the UART, allocate memory, create queues and tasks.
+*/
 LinkStatus Link_Init(Link *link, const LinkConfig *config)
 {
 	if ((link == NULL) || (config == NULL)) return LINK_INVALID_ARG;
@@ -38,6 +53,7 @@ LinkStatus Link_Init(Link *link, const LinkConfig *config)
 
 	if (Protocol_ParserInit(&link->parser, config->max_payload) != PROTOCOL_OK) return LINK_ERROR;
 
+	// UART settings: 8 data bits, no parity, 1 stop bit, no flow control.
 	uart_config_t uart_config = {
 		.baud_rate = config->baud_rate > 0 ? config->baud_rate : 115200,
 		.data_bits = UART_DATA_8_BITS,
@@ -49,11 +65,13 @@ LinkStatus Link_Init(Link *link, const LinkConfig *config)
 
 	if (uart_param_config(config->uart_num, &uart_config) != ESP_OK) return LINK_ERROR;
 	if (uart_set_pin(config->uart_num, config->tx_pin, config->rx_pin, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE) != ESP_OK) return LINK_ERROR;
+	// Install the driver. It has its own RX and TX buffers.
 	if (uart_driver_install(config->uart_num, config->rx_buffer_size > 0 ? config->rx_buffer_size : 1024, config->tx_buffer_size > 0 ? config->tx_buffer_size : 1024, 0, NULL, 0) != ESP_OK)
 	{
 		return LINK_ERROR;
 	}
 
+	// Slot size is rounded up to a multiple of 4 bytes.
 	link->tx_slot_size = (uint16_t)((TX_SLOT_HEADER_SIZE + config->max_payload + 3U) & ~3U);
 	link->tx_pool = (uint8_t *)pvPortMalloc((size_t)link->tx_slot_size * config->tx_queue_length);
 	link->tx_free_queue = xQueueCreate(config->tx_queue_length, sizeof(uint16_t));
@@ -66,6 +84,7 @@ LinkStatus Link_Init(Link *link, const LinkConfig *config)
 		return LINK_ERROR;
 	}
 
+	// At the start all slots are free.
 	for (uint16_t i = 0; i < config->tx_queue_length; i++)
 	{
 		xQueueSend(link->tx_free_queue, &i, 0);
@@ -84,6 +103,10 @@ LinkStatus Link_Init(Link *link, const LinkConfig *config)
 	return LINK_OK;
 }
 
+/*
+*	Copy the message into a free slot and give it to the TX task.
+*	queue_wait_ticks = how long we wait for a free slot (0 = do not wait).
+*/
 LinkStatus Link_Send(Link *link, uint16_t message_id, const void *payload, uint16_t length, TickType_t queue_wait_ticks)
 {
 	if (!link || link->initialized == 0U) return LINK_NOT_INITIALIZED;
@@ -105,6 +128,9 @@ LinkStatus Link_Send(Link *link, uint16_t message_id, const void *payload, uint1
 	return LINK_OK;
 }
 
+/*
+*	TX task: make a packet from a slot and write it to the UART.
+*/
 static void link_tx_task(void *arg)
 {
 	Link *link = (Link *)arg;
@@ -128,6 +154,7 @@ static void link_tx_task(void *arg)
 		}
 		link->tx_seq++;
 
+		// If not all bytes were accepted, count an error.
 		int written = uart_write_bytes(link->config.uart_num, link->tx_packet, packet_length);
 		if (written < 0 || (size_t)written != packet_length)
 		{
@@ -140,6 +167,10 @@ static void link_tx_task(void *arg)
 	}
 }
 
+/*
+*	Find subscribers for this message id and call them.
+*	They are copied under the mutex, but called AFTER unlock.
+*/
 static void link_dispatch(Link *link, const ProtocolMessage *pm)
 {
 	uint32_t count = 0U;
@@ -162,17 +193,19 @@ static void link_dispatch(Link *link, const ProtocolMessage *pm)
 	}
 }
 
+/*
+*	RX task: read bytes from the UART, give them to the parser, handle each result.
+*/
 static void link_rx_task(void *arg)
 {
 	Link *link = (Link *)arg;
 	uint8_t rx_chunk[64];
 
-	// Конвертуємо тіки у мілісекунди для ESP-IDF uart_read_bytes
-	// Якщо rx_poll_ticks дорівнює 0, ставимо невеликий таймаут або portMAX_DELAY за потребою
+	// Wait for data (up to the timeout). Then feed the parser.
 	TickType_t ticks = link->config.rx_poll_ticks;
 	uint32_t timeout_ms = (ticks == portMAX_DELAY) ? portMAX_DELAY : (ticks * portTICK_PERIOD_MS);
 	if (timeout_ms == 0) {
-		timeout_ms = 1; // Уникаємо нескінченного блокування при 0
+		timeout_ms = 1;
 	}
 
 	for (;;)
@@ -195,6 +228,9 @@ static void link_rx_task(void *arg)
 	}
 }
 
+/*
+*	Add a callback for one message id.
+*/
 LinkStatus Link_Subscribe(Link *link, uint16_t message_id, Link_Callback callback, void *context)
 {
 	if (!link || !callback) return LINK_INVALID_ARG;

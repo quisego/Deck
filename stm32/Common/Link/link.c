@@ -1,9 +1,22 @@
+/*
+*	Link (STM32 version) = a message channel over UART between STM32 and ESP32.
+*	SEND: Link_Send() copies the message to a free slot -> TX task makes a packet -> UART DMA sends it.
+*	RECEIVE: UART DMA fills a ring buffer -> RX task reads it -> parser finds packets
+*	-> callbacks of subscribers are called.
+*/
+
 #include "link.h"
 #include <string.h>
 
+/*
+*	RX buffer is a ring (circular) buffer. DMA writes into it all the time.
+*/
 #define RX_SIZE LINK_RX_BUFFER_SIZE
 #define RX_HALF (RX_SIZE / 2U)
 
+/*
+*	States of one transmit operation.
+*/
 enum
 {
 	TX_IDLE = 0,
@@ -12,6 +25,9 @@ enum
 	TX_FAILED
 };
 
+/*
+*	One TX slot: id, length, and then the payload bytes (flexible array).
+*/
 typedef struct
 {
 	uint16_t id;
@@ -21,6 +37,9 @@ typedef struct
 
 #define TX_SLOT_HEADER_SIZE ((uint16_t)sizeof(LinkTxSlot))
 
+/*
+*	All Link objects. Interrupt callbacks use it to find the Link for a UART.
+*/
 static Link *s_ports[LINK_MAX_INSTANCES] = {0};
 
 static Link *find_port(const UART_HandleTypeDef *huart)
@@ -35,6 +54,9 @@ static Link *find_port(const UART_HandleTypeDef *huart)
 	return NULL;
 }
 
+/*
+*	Wake a task from an interrupt.
+*/
 static void notify_from_isr(TaskHandle_t task)
 {
 	if (task != NULL)
@@ -45,11 +67,17 @@ static void notify_from_isr(TaskHandle_t task)
 	}
 }
 
+/*
+*	Atomic counter +1. It is safe in interrupts and in tasks.
+*/
 static void count(volatile uint32_t *counter)
 {
 	(void)__atomic_add_fetch(counter, 1U, __ATOMIC_RELAXED);
 }
 
+/*
+*	Mutex helpers. We use the mutex to protect statistics and the subscriber list.
+*/
 static void lock(Link *link) { (void)xSemaphoreTake(link->lock, portMAX_DELAY); }
 static void unlock(Link *link) { (void)xSemaphoreGive(link->lock); }
 
@@ -61,11 +89,18 @@ static void stat_add(Link *link, uint32_t *counter, uint32_t value)
 	unlock(link);
 }
 
+/*
+*	Get the address of slot number "index" in the pool.
+*/
 static LinkTxSlot *tx_slot(Link *link, uint16_t index)
 {
 	return (LinkTxSlot *)(void *)(link->tx_pool + ((size_t)index * link->tx_slot_size));
 }
 
+/*
+*	Start circular DMA receive. The IDLE interrupt fires when the line is quiet for a moment
+*	(this means "a packet probably ended").
+*/
 static HAL_StatusTypeDef rx_start(Link *p)
 {
 	p->rx_read_total = 0U;
@@ -79,8 +114,13 @@ static HAL_StatusTypeDef rx_start(Link *p)
 	return status;
 }
 
+/*
+*	Copy new received bytes from the ring buffer to "dst". Returns how many bytes we copied.
+*	DMA does not tell us how many laps it made, so we count half-buffer interrupts (rx_halves).
+*/
 static uint16_t rx_take(Link *p, uint8_t *dst, uint16_t max_len)
 {
+	// Read the lap counter and the DMA position. Repeat if an interrupt changed the counter meanwhile.
 	uint32_t halves, pos;
 	do
 	{
@@ -89,12 +129,16 @@ static uint16_t rx_take(Link *p, uint8_t *dst, uint16_t max_len)
 		pos = (RX_SIZE - ndtr) % RX_SIZE;
 	} while (halves != p->rx_halves);
 
+	// Fix the lap counter if the interrupt for a half is late.
 	const uint32_t in_second_half = (pos >= RX_HALF) ? 1U : 0U;
 	if ((halves & 1U) != in_second_half) halves++;
 
+	// Total bytes written by DMA since the start = laps * size + position.
 	const uint32_t written = ((halves >> 1) * RX_SIZE) + pos;
 	const uint32_t pending = written - p->rx_read_total;
 
+	// More unread bytes than the buffer size: DMA already overwrote old data. We were too slow.
+	// Count the error and skip the lost data.
 	if (pending > RX_SIZE)
 	{
 		count(&p->rx_overflow);
@@ -106,6 +150,7 @@ static uint16_t rx_take(Link *p, uint8_t *dst, uint16_t max_len)
 	if (n > max_len) n = max_len;
 	if (n == 0U) return 0U;
 
+	// Copy in two parts if the data goes around the end of the ring buffer.
 	const uint32_t index = p->rx_read_total % RX_SIZE;
 	const uint32_t first = ((RX_SIZE - index) < n) ? (RX_SIZE - index) : n;
 	memcpy(dst, &p->rx_buf[index], first);
@@ -117,9 +162,13 @@ static uint16_t rx_take(Link *p, uint8_t *dst, uint16_t max_len)
 static void link_tx_task(void *arg);
 static void link_rx_task(void *arg);
 
+/*
+*	Start the link. Steps: check input, allocate memory, create queues, start DMA, create tasks.
+*/
 LinkStatus Link_Init(Link *link, const LinkConfig *config)
 {
 	if ((link == NULL) || (config == NULL) || (config->huart == NULL)) return LINK_INVALID_ARG;
+	// UART needs a TX DMA and an RX DMA in circular mode.
 	if (config->huart->hdmatx == NULL || config->huart->hdmarx == NULL || config->huart->hdmarx->Init.Mode != DMA_CIRCULAR)
 	{
 		return LINK_INVALID_ARG;
@@ -131,6 +180,7 @@ LinkStatus Link_Init(Link *link, const LinkConfig *config)
 
 	if (Protocol_ParserInit(&link->parser, config->max_payload) != PROTOCOL_OK) return LINK_ERROR;
 
+	// Slot size is rounded up to a multiple of 4 bytes (memory alignment).
 	link->tx_slot_size = (uint16_t)((TX_SLOT_HEADER_SIZE + config->max_payload + 3U) & ~3U);
 	link->tx_pool = (uint8_t *)pvPortMalloc((size_t)link->tx_slot_size * config->tx_queue_length);
 	link->tx_free_queue = xQueueCreate(config->tx_queue_length, sizeof(uint16_t));
@@ -146,11 +196,13 @@ LinkStatus Link_Init(Link *link, const LinkConfig *config)
 		return LINK_ERROR;
 	}
 
+	// At the start all slots are free: put all indexes in the "free" queue.
 	for (uint16_t i = 0; i < config->tx_queue_length; i++)
 	{
 		xQueueSend(link->tx_free_queue, &i, 0);
 	}
 
+	// Find a free place in s_ports. Reject the same UART used twice.
 	uint32_t slot_idx = LINK_MAX_INSTANCES;
 	for (uint32_t i = 0; i < LINK_MAX_INSTANCES; i++)
 	{
@@ -189,6 +241,10 @@ LinkStatus Link_Init(Link *link, const LinkConfig *config)
 	return LINK_OK;
 }
 
+/*
+*	Send a message. Copy it into a free slot and give the slot to the TX task.
+*	queue_wait_ticks = how long we wait for a free slot (0 = do not wait).
+*/
 LinkStatus Link_Send(Link *link, uint16_t message_id, const void *payload, uint16_t length, TickType_t queue_wait_ticks)
 {
 	if (!link || link->initialized == 0U) return LINK_NOT_INITIALIZED;
@@ -210,6 +266,9 @@ LinkStatus Link_Send(Link *link, uint16_t message_id, const void *payload, uint1
 	return LINK_OK;
 }
 
+/*
+*	TX task: take a slot, make a packet, send it with DMA, wait until it is done.
+*/
 static void link_tx_task(void *arg)
 {
 	Link *link = (Link *)arg;
@@ -224,6 +283,7 @@ static void link_tx_task(void *arg)
 			link->tx_packet, sizeof(link->tx_packet), &packet_length,
 			slot->id, link->tx_seq, slot->payload, slot->length);
 
+		// The packet is in tx_packet now, so the slot is free again.
 		xQueueSend(link->tx_free_queue, &index, 0);
 
 		if (encoded != PROTOCOL_OK)
@@ -233,6 +293,7 @@ static void link_tx_task(void *arg)
 		}
 		link->tx_seq++;
 
+		// Prepare to wait: the TX complete interrupt will wake this task.
 		link->tx_waiter = xTaskGetCurrentTaskHandle();
 		link->tx_state = TX_PENDING;
 		(void)ulTaskNotifyTake(pdTRUE, 0);
@@ -244,6 +305,7 @@ static void link_tx_task(void *arg)
 			continue;
 		}
 
+		// Wait for DMA to finish. We also stop on timeout so we never wait forever.
 		const TickType_t start = xTaskGetTickCount();
 		while (link->tx_state == TX_PENDING)
 		{
@@ -252,6 +314,7 @@ static void link_tx_task(void *arg)
 			ulTaskNotifyTake(pdTRUE, link->config.tx_timeout_ticks - elapsed);
 		}
 
+		// Still pending = timeout. Abort the transfer and count it.
 		if (link->tx_state == TX_PENDING)
 		{
 			HAL_UART_AbortTransmit(link->huart);
@@ -270,6 +333,9 @@ static void link_tx_task(void *arg)
 	}
 }
 
+/*
+*	A full message arrived. Copy the matching subscribers while the mutex is locked.
+*/
 static void link_dispatch(Link *link, const ProtocolMessage *pm)
 {
 	uint32_t count = 0U;
@@ -288,10 +354,14 @@ static void link_dispatch(Link *link, const ProtocolMessage *pm)
 	const LinkMessage message = { .id = pm->id, .length = pm->length, .payload = pm->payload };
 	for (uint32_t i = 0; i < count; i++)
 	{
+		// Call the callbacks AFTER we unlock, so a callback can use Link functions without deadlock.
 		link->rx_snapshot[i].callback(&message, link->rx_snapshot[i].context);
 	}
 }
 
+/*
+*	RX task: read bytes, give them to the parser, and handle every result.
+*/
 static void link_rx_task(void *arg)
 {
 	Link *link = (Link *)arg;
@@ -301,12 +371,14 @@ static void link_rx_task(void *arg)
 		uint16_t n = rx_take(link, link->rx_chunk, sizeof(link->rx_chunk));
 		if (n == 0U)
 		{
+			// After a UART error, restart DMA receive.
 			if (link->rx_restart_pending)
 			{
 				HAL_UART_AbortReceive(link->huart);
 				rx_start(link);
 				link->rx_restart_pending = 0;
 			}
+			// Sleep until an interrupt wakes us, or until the poll time ends.
 			ulTaskNotifyTake(pdTRUE, link->config.rx_poll_ticks);
 			n = rx_take(link, link->rx_chunk, sizeof(link->rx_chunk));
 		}
@@ -316,6 +388,7 @@ static void link_rx_task(void *arg)
 			size_t offset = 0U;
 			ProtocolMessage msg;
 			ProtocolParseResult res;
+			// Handle each result: message -> dispatch, error -> count it in statistics.
 			while ((res = Protocol_ParserProcess(&link->parser, link->rx_chunk, n, &offset, &msg)) != PROTOCOL_PARSE_NONE)
 			{
 				if (res == PROTOCOL_PARSE_MESSAGE) link_dispatch(link, &msg);
@@ -328,6 +401,9 @@ static void link_rx_task(void *arg)
 	}
 }
 
+/*
+*	Add a callback for one message id. The same callback cannot be added twice.
+*/
 LinkStatus Link_Subscribe(Link *link, uint16_t message_id, Link_Callback callback, void *context)
 {
 	if (!link || !callback) return LINK_INVALID_ARG;
@@ -357,6 +433,9 @@ LinkStatus Link_Subscribe(Link *link, uint16_t message_id, Link_Callback callbac
 	return res;
 }
 
+/*
+*	Remove a callback.
+*/
 LinkStatus Link_Unsubscribe(Link *link, uint16_t message_id, Link_Callback callback, void *context)
 {
 	if (!link || !callback) return LINK_INVALID_ARG;
@@ -377,6 +456,9 @@ LinkStatus Link_Unsubscribe(Link *link, uint16_t message_id, Link_Callback callb
 	return res;
 }
 
+/*
+*	Get a copy of the statistics.
+*/
 LinkStatus Link_GetStats(Link *link, LinkStats *out)
 {
 	if (!link || !out) return LINK_INVALID_ARG;
@@ -397,7 +479,9 @@ LinkStatus Link_ResetStats(Link *link)
 	return LINK_OK;
 }
 
-/* HAL Callbacks */
+/*
+*	Call this from the UART interrupt. IDLE flag = the line was quiet = wake the RX task.
+*/
 void Link_UART_IRQHandler(UART_HandleTypeDef *huart)
 {
 	Link *p = find_port(huart);
@@ -410,6 +494,9 @@ void Link_UART_IRQHandler(UART_HandleTypeDef *huart)
 	}
 }
 
+/*
+*	TX DMA finished OK: tell the TX task.
+*/
 void Link_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 {
 	Link *p = find_port(huart);
@@ -420,6 +507,9 @@ void Link_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 	}
 }
 
+/*
+*	Count one half of the ring buffer and wake the RX task.
+*/
 void Link_UART_RxHalfCpltCallback(UART_HandleTypeDef *huart)
 {
 	Link *p = find_port(huart);
@@ -432,6 +522,9 @@ void Link_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 	if (p) { p->rx_halves++; notify_from_isr(p->rx_waiter); }
 }
 
+/*
+*	UART error: count it, ask the RX task to restart DMA, and wake the TX task if it waits.
+*/
 void Link_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
 	Link *p = find_port(huart);

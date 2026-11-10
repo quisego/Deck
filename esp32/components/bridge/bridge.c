@@ -1,3 +1,15 @@
+/*
+*	Bridge (ESP32): connects the STM32 data with the internet.
+*
+*	STM32 -> (UART) -> ESP32 -> Wi-Fi -> MQTT broker, and MQTT commands go back to the STM32.
+*
+*	It also gets the real time from the internet (SNTP) and can write it to the STM32 clock.
+*
+*	Words: MQTT "retain" = the broker keeps the last value for new subscribers.
+*
+*	QoS 0 = send once. QoS 1 = the broker must confirm.
+*/
+
 #include "bridge.h"
 
 #include <stdio.h>
@@ -19,61 +31,91 @@
 #include "nvs_flash.h"
 
 /*
-	Topics (BASE = CONFIG_APP_MQTT_BASE_TOPIC):
-
-	BASE/status                  "online" / "offline" (LWT)           retained  — bridge ESP32
-	BASE/esp/state               {"uptime_s","heap_free","heap_min","rssi"}  retained, once for 30 s
-	BASE/stm/online              "1" / "0" (STM32 silence > APP_STM_TIMEOUT_S)  retained
-	BASE/stm/state               {"uptime_s","heap_free","heap_min","oled","rtc","bme"}  retained
-	BASE/sensor/env              {"temperature_c","humidity_pct","pressure_hpa"}  retained, only once when changed
-	BASE/sensor/temperature|humidity|pressure    (retained)
-	BASE/rtc/time                {"iso":"2026-11-07T12:00:00","weekday":7}  retained, once for N s
-	BASE/button/<A|B>/event      {"event","clicks","duration_ms","stm_ts_ms"}
-	BASE/button/<A|B>/state      "1" / "0"  retained
-
-	Команди (підписка):
-	BASE/cmd/rtc/set             "YYYY-MM-DD HH:MM:SS"  -> write time to DS1307
-	BASE/cmd/rtc/sync            будь-який payload      -> write time ESP32 (SNTP) у DS1307
-	BASE/cmd/rtc/result          "ok" / "error"  (answer)
+*	Topics (BASE = CONFIG_APP_MQTT_BASE_TOPIC):
+*
+*	BASE/status                  "online" / "offline" (LWT)           retained  — bridge ESP32
+*
+*	BASE/esp/state               {"uptime_s","heap_free","heap_min","rssi"}  retained, once for 30 s
+*
+*	BASE/stm/online              "1" / "0" (STM32 silence > APP_STM_TIMEOUT_S)  retained
+*
+*	BASE/stm/state               {"uptime_s","heap_free","heap_min","oled","rtc","bme"}  retained
+*
+*	BASE/sensor/env              {"temperature_c","humidity_pct","pressure_hpa"}  retained, only once when changed
+*
+*	BASE/sensor/temperature|humidity|pressure    (retained)
+*
+*	BASE/rtc/time                {"iso":"2026-11-07T12:00:00","weekday":7}  retained, once for N s
+*
+*	BASE/button/<A|B>/event      {"event","clicks","duration_ms","stm_ts_ms"}
+*
+*	BASE/button/<A|B>/state      "1" / "0"  retained
+*
+*	Commands (subs):
+*	BASE/cmd/rtc/set             "YYYY-MM-DD HH:MM:SS"  -> write time to DS1307
+*
+*	BASE/cmd/rtc/sync            any payload      -> write time ESP32 (SNTP) у DS1307
+*
+*	BASE/cmd/rtc/result          "ok" / "error"  (answer)
 */
 
+/*
+*	CONFIG_... values come from the project settings (menuconfig / Kconfig).
+*/
 #define BASE CONFIG_APP_MQTT_BASE_TOPIC
 #define TOPIC_MAX 96
 #define JSON_MAX 256
+/*
+*	The bridge task runs every 5 seconds. The ESP state is published every 6th run (30 s).
+*/
 #define BRIDGE_TASK_STACK 4096
 #define BRIDGE_PERIOD_MS 5000
 #define ESP_STATE_EVERY_TICKS 6 /* 6 * 5 s = 30 s */
 
 static const char *TAG = "bridge";
 
+/*
+*	Module state. s_lock protects the data that several tasks use.
+*/
 static Link *s_link;
 static esp_mqtt_client_handle_t s_client;
 static volatile bool s_connected;
 static SemaphoreHandle_t s_lock;
 
+/*
+*	Is the STM32 alive? We update this when any message arrives.
+*/
 static bool s_stm_online;
 static int64_t s_last_stm_ms;
 
+/*
+*	Last JSON messages. We publish them again after MQTT reconnects.
+*/
 static char s_cache_env[JSON_MAX];
 static char s_cache_stm[JSON_MAX];
 
 static char s_will_topic[TOPIC_MAX];
 static bool s_sntp_started;
 
-/* ------------------------------------------------------------------ */
-/* Helpers                                                             */
-/* ------------------------------------------------------------------ */
-
+/*
+*	Time since boot in milliseconds.
+*/
 static int64_t now_ms(void)
 {
 	return esp_timer_get_time() / 1000;
 }
 
+/*
+*	Build a full topic: BASE/suffix.
+*/
 static void make_topic(char *out, size_t size, const char *suffix)
 {
 	(void)snprintf(out, size, "%s/%s", BASE, suffix);
 }
 
+/*
+*	Send one MQTT message. If MQTT is not connected, we silently do nothing.
+*/
 static void publish(const char *suffix, const char *payload, int qos, bool retain)
 {
 	if (s_client == NULL || !s_connected)
@@ -85,12 +127,16 @@ static void publish(const char *suffix, const char *payload, int qos, bool retai
 
 	make_topic(topic, sizeof(topic), suffix);
 
+	// Enqueue puts the message in a queue (it does not block). A negative result means failure.
 	if (esp_mqtt_client_enqueue(s_client, topic, payload, 0, qos, retain, true) < 0)
 	{
 		ESP_LOGW(TAG, "enqueue failed: %s", topic);
 	}
 }
 
+/*
+*	Save a copy of the last JSON (with the mutex).
+*/
 static void cache_set(char *dst, const char *src)
 {
 	xSemaphoreTake(s_lock, portMAX_DELAY);
@@ -98,6 +144,10 @@ static void cache_set(char *dst, const char *src)
 	xSemaphoreGive(s_lock);
 }
 
+/*
+*	Call this on every STM32 message: "the STM32 is alive".
+*	If it was offline before, publish "online".
+*/
 static void touch_stm(void)
 {
 	bool flipped = false;
@@ -118,10 +168,9 @@ static void touch_stm(void)
 	}
 }
 
-/* ------------------------------------------------------------------ */
-/* STM32 -> MQTT                                                       */
-/* ------------------------------------------------------------------ */
-
+/*
+*	Called from main.c for each button event. Make JSON and publish it.
+*/
 void Bridge_OnButton(uint16_t msg_id, const char *name, const ProtoButtonEvent *ev)
 {
 	touch_stm();
@@ -143,8 +192,10 @@ void Bridge_OnButton(uint16_t msg_id, const char *name, const ProtoButtonEvent *
 	(void)snprintf(suffix, sizeof(suffix), "button/%s/event", name);
 	(void)snprintf(json, sizeof(json), "{\"event\":\"%s\",\"clicks\":%u,\"duration_ms\":%u,\"stm_ts_ms\":%u}",
 		event, (unsigned)ev->click_count, (unsigned)ev->duration_ms, (unsigned)ev->timestamp_ms);
+	// The event is not retained (it is a one-time event).
 	publish(suffix, json, 1, false);
 
+	// Pressed and released also update the retained button state: "1" or "0".
 	if (msg_id == MSG_ID_BUTTON_PRESSED || msg_id == MSG_ID_BUTTON_RELEASED)
 	{
 		(void)snprintf(suffix, sizeof(suffix), "button/%s/state", name);
@@ -152,8 +203,12 @@ void Bridge_OnButton(uint16_t msg_id, const char *name, const ProtoButtonEvent *
 	}
 }
 
+/*
+*	Called when a new time arrives from the STM32.
+*/
 void Bridge_OnRtc(const ProtoRtcTime *t)
 {
+	// Publish only every N-th time message, so we do not flood MQTT.
 	static uint32_t counter;
 
 	touch_stm();
@@ -171,6 +226,9 @@ void Bridge_OnRtc(const ProtoRtcTime *t)
 	publish("rtc/time", json, 0, true);
 }
 
+/*
+*	Values are multiplied by 100. We print them with 2 decimals, using only integer math.
+*/
 static void format_env_json(const ProtoEnvData *e, char *json, size_t size)
 {
 	const int t = e->temperature_c_x100;
@@ -182,6 +240,9 @@ static void format_env_json(const ProtoEnvData *e, char *json, size_t size)
 		(unsigned)(e->pressure_pa / 100U), (unsigned)(e->pressure_pa % 100U));
 }
 
+/*
+*	Publish the JSON, then also each value in its own topic.
+*/
 void Bridge_OnEnv(const ProtoEnvData *e)
 {
 	touch_stm();
@@ -205,6 +266,9 @@ void Bridge_OnEnv(const ProtoEnvData *e)
 	publish("sensor/pressure", val, 1, true);
 }
 
+/*
+*	Publish the STM32 health data as JSON.
+*/
 void Bridge_OnStmStatus(const ProtoSysStatus *s)
 {
 	touch_stm();
@@ -221,10 +285,9 @@ void Bridge_OnStmStatus(const ProtoSysStatus *s)
 	publish("stm/state", json, 1, true);
 }
 
-/* ------------------------------------------------------------------ */
-/* cmd MQTT -> STM32                                 		              */
-/* ------------------------------------------------------------------ */
-
+/*
+*	Send the "set RTC time" message to the STM32. Weekday is 0 here, the STM32 calculates it.
+*/
 bool Bridge_SendRtcSet(uint16_t year, uint8_t month, uint8_t date, uint8_t hours, uint8_t minutes, uint8_t seconds)
 {
 	if (s_link == NULL)
@@ -250,9 +313,13 @@ bool Bridge_SendRtcSet(uint16_t year, uint8_t month, uint8_t date, uint8_t hours
 		return false;
 	}
 
+	// Wait up to 20 ms for a free TX slot.
 	return Link_Send(s_link, (uint16_t)MSG_ID_RTC_SET, buf, (uint16_t)len, pdMS_TO_TICKS(20)) == LINK_OK;
 }
 
+/*
+*	Take the ESP32 system time (from SNTP) and send it to the STM32 clock.
+*/
 static bool sync_rtc_from_system(void)
 {
 	const time_t now = time(NULL);
@@ -260,6 +327,7 @@ static bool sync_rtc_from_system(void)
 
 	localtime_r(&now, &tm);
 
+	// If the year is before 2024, SNTP has not set the time yet. Do not send the wrong time.
 	if (tm.tm_year < (2024 - 1900))
 	{
 		return false;
@@ -269,6 +337,9 @@ static bool sync_rtc_from_system(void)
 		(uint8_t)tm.tm_hour, (uint8_t)tm.tm_min, (uint8_t)tm.tm_sec);
 }
 
+/*
+*	Check if the received topic is equal to BASE/suffix.
+*/
 static bool topic_is(const esp_mqtt_event_handle_t ev, const char *suffix)
 {
 	char full[TOPIC_MAX];
@@ -278,8 +349,12 @@ static bool topic_is(const esp_mqtt_event_handle_t ev, const char *suffix)
 	return ev->topic_len == (int)strlen(full) && memcmp(ev->topic, full, (size_t)ev->topic_len) == 0;
 }
 
+/*
+*	Handle one incoming MQTT message (a command).
+*/
 static void handle_command(const esp_mqtt_event_handle_t ev)
 {
+	// Accept only a complete, short message. Ignore fragments and long data.
 	if (ev->current_data_offset != 0 || ev->data_len != ev->total_data_len || ev->data_len >= 40)
 	{
 		return;
@@ -295,6 +370,7 @@ static void handle_command(const esp_mqtt_event_handle_t ev)
 		unsigned y, mo, d, h, mi, s;
 		bool ok = false;
 
+		// Read the format "YYYY-MM-DD HH:MM:SS". A "T" between date and time is also OK.
 		if (sscanf(payload, "%u-%u-%u%*[ T]%u:%u:%u", &y, &mo, &d, &h, &mi, &s) == 6)
 		{
 			ok = Bridge_SendRtcSet((uint16_t)y, (uint8_t)mo, (uint8_t)d, (uint8_t)h, (uint8_t)mi, (uint8_t)s);
@@ -312,10 +388,9 @@ static void handle_command(const esp_mqtt_event_handle_t ev)
 	}
 }
 
-/* ------------------------------------------------------------------ */
-/* MQTT                                                                */
-/* ------------------------------------------------------------------ */
-
+/*
+*	Called by the MQTT library when something happens.
+*/
 static void mqtt_event_handler(void *args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
 	(void)args;
@@ -325,6 +400,7 @@ static void mqtt_event_handler(void *args, esp_event_base_t base, int32_t event_
 
 	switch ((esp_mqtt_event_id_t)event_id)
 	{
+	// Connected: say "online", subscribe to the command topics, and publish saved values again.
 	case MQTT_EVENT_CONNECTED:
 	{
 		ESP_LOGI(TAG, "MQTT connected");
@@ -342,6 +418,7 @@ static void mqtt_event_handler(void *args, esp_event_base_t base, int32_t event_
 		char json[JSON_MAX];
 
 		xSemaphoreTake(s_lock, portMAX_DELAY);
+		// Copy the values under the mutex, then publish after we release it.
 		const bool stm_online = s_stm_online;
 		strlcpy(json, s_cache_env, sizeof(json));
 		xSemaphoreGive(s_lock);
@@ -380,6 +457,9 @@ static void mqtt_event_handler(void *args, esp_event_base_t base, int32_t event_
 	}
 }
 
+/*
+*	Set up and start the MQTT client.
+*/
 static void mqtt_start(void)
 {
 	make_topic(s_will_topic, sizeof(s_will_topic), "status");
@@ -393,6 +473,7 @@ static void mqtt_start(void)
 		.credentials.username = (user[0] != '\0') ? user : NULL,
 		.credentials.authentication.password = (pass[0] != '\0') ? pass : NULL,
 		.session.keepalive = 30,
+		// Last Will: if the ESP32 disappears, the broker publishes "offline" for us.
 		.session.last_will = {
 			.topic = s_will_topic,
 			.msg = "offline",
@@ -414,10 +495,9 @@ static void mqtt_start(void)
 	ESP_ERROR_CHECK(esp_mqtt_client_start(s_client));
 }
 
-/* ------------------------------------------------------------------ */
-/* Wi-Fi + SNTP                                                        */
-/* ------------------------------------------------------------------ */
-
+/*
+*	Optional feature: when SNTP sets the time, automatically write it to the STM32 clock.
+*/
 #if CONFIG_APP_RTC_SYNC_ON_SNTP
 static void sntp_synced_cb(struct timeval *tv)
 {
@@ -429,6 +509,9 @@ static void sntp_synced_cb(struct timeval *tv)
 }
 #endif
 
+/*
+*	Start SNTP (internet time) only one time.
+*/
 static void sntp_start_once(void)
 {
 	if (s_sntp_started)
@@ -438,11 +521,13 @@ static void sntp_start_once(void)
 
 	s_sntp_started = true;
 
+	// Set the time zone, so localtime() gives local time.
 	(void)setenv("TZ", CONFIG_APP_TZ, 1);
 	tzset();
 
 	esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
 
+// Use our callback only if the feature is turned on.
 #if CONFIG_APP_RTC_SYNC_ON_SNTP
 	cfg.sync_cb = sntp_synced_cb;
 #endif
@@ -450,6 +535,9 @@ static void sntp_start_once(void)
 	ESP_ERROR_CHECK(esp_netif_sntp_init(&cfg));
 }
 
+/*
+*	Wi-Fi events: connect on start, reconnect after a disconnect, start SNTP when we get an IP.
+*/
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
 	(void)arg;
@@ -471,8 +559,12 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
 	}
 }
 
+/*
+*	Start Wi-Fi in station mode (the ESP32 connects to a router).
+*/
 static void wifi_start(void)
 {
+	// NVS storage is needed by Wi-Fi. If it is full or has an old version, erase and try again.
 	esp_err_t err = nvs_flash_init();
 
 	if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND)
@@ -498,6 +590,7 @@ static void wifi_start(void)
 	ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL));
 	ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL));
 
+	// Wi-Fi name and password. No password means an open network.
 	wifi_config_t wc = { 0 };
 
 	strlcpy((char *)wc.sta.ssid, CONFIG_APP_WIFI_SSID, sizeof(wc.sta.ssid));
@@ -509,10 +602,9 @@ static void wifi_start(void)
 	ESP_ERROR_CHECK(esp_wifi_start());
 }
 
-/* ------------------------------------------------------------------ */
-/* Task: timeout STM32 + state ESP32         			                		*/
-/* ------------------------------------------------------------------ */
-
+/*
+*	Publish ESP32 information: uptime, free memory, Wi-Fi signal strength (RSSI).
+*/
 static void publish_esp_state(void)
 {
 	wifi_ap_record_t ap;
@@ -524,6 +616,9 @@ static void publish_esp_state(void)
 	publish("esp/state", json, 0, true);
 }
 
+/*
+*	Every 5s: check if the STM32 was silent too long (then publish "offline"), and publish ESP state.
+*/
 static void bridge_task(void *arg)
 {
 	(void)arg;
@@ -558,10 +653,9 @@ static void bridge_task(void *arg)
 	}
 }
 
-/* ------------------------------------------------------------------ */
-/* Public                                                              */
-/* ------------------------------------------------------------------ */
-
+/*
+*	Start Wi-Fi, MQTT and the bridge task.
+*/
 void Bridge_Init(Link *link)
 {
 	s_link = link;

@@ -1,3 +1,8 @@
+/*
+*	ESP32 main file. It receives messages from the STM32 over UART,
+*	prints them to the log, and gives them to the "bridge" (Wi-Fi + MQTT).
+*/
+
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
@@ -8,13 +13,22 @@
 #include "link.h"
 #include "msg.h"
 
+/*
+*	Name for ESP_LOGx messages.
+*/
 static const char *TAG = "app";
 
 static Link g_link;
 
+/*
+*	Button ids. They must be the same as the ids made on the STM32 (port + pin).
+*/
 #define BTN_ID_A 0x10U
 #define BTN_ID_B 0x11U
 
+/*
+*	Information about one button: id, name and the last known state.
+*/
 typedef struct
 {
 	uint8_t id;
@@ -27,8 +41,14 @@ static ButtonSlot s_buttons[] = {
 	{ .id = BTN_ID_B, .name = "B", .pressed = false },
 };
 
+/*
+*	Number of buttons in the array.
+*/
 #define BUTTON_SLOTS (sizeof(s_buttons) / sizeof(s_buttons[0]))
 
+/*
+*	Find a button by its id. Returns NULL if it is unknown.
+*/
 static ButtonSlot *find_slot(uint8_t id)
 {
 	for (size_t i = 0; i < BUTTON_SLOTS; i++)
@@ -47,12 +67,16 @@ static void log_state(void)
 	ESP_LOGI(TAG, "A=%d B=%d", s_buttons[0].pressed ? 1 : 0, s_buttons[1].pressed ? 1 : 0);
 }
 
+/*
+*	Callback: STM32 sent a button event. Decode it, update the state, log it, send to MQTT.
+*/
 static void on_button_message(const LinkMessage *msg, void *ctx)
 {
 	(void)ctx;
 
 	ProtoButtonEvent ev;
 
+	// Wrong payload size or content -> warning and stop.
 	if (ProtoMsg_DecodeButtonEvent(msg->payload, msg->length, &ev) != PROTOCOL_OK)
 	{
 		ESP_LOGW(TAG, "Bad button payload (id=0x%04x, len=%u)", (unsigned)msg->id, (unsigned)msg->length);
@@ -67,6 +91,7 @@ static void on_button_message(const LinkMessage *msg, void *ctx)
 		return;
 	}
 
+	// The message id tells which event it is.
 	switch (msg->id)
 	{
 	case MSG_ID_BUTTON_PRESSED:
@@ -96,6 +121,9 @@ static void on_button_message(const LinkMessage *msg, void *ctx)
 	Bridge_OnButton(msg->id, slot->name, &ev);
 }
 
+/*
+*	Callback: new time from the STM32 clock.
+*/
 static void on_rtc_message(const LinkMessage *msg, void *ctx)
 {
 	(void)ctx;
@@ -115,6 +143,9 @@ static void on_rtc_message(const LinkMessage *msg, void *ctx)
 	Bridge_OnRtc(&t);
 }
 
+/*
+*	Callback: new temperature, humidity and pressure. Values come multiplied by 100.
+*/
 static void on_env_message(const LinkMessage *msg, void *ctx)
 {
 	(void)ctx;
@@ -128,6 +159,7 @@ static void on_env_message(const LinkMessage *msg, void *ctx)
 	}
 
 	const int t = e.temperature_c_x100;
+	// Use the absolute value so we can print "-" and the digits separately (also for -0.5).
 	const int t_abs = (t < 0) ? -t : t;
 
 	ESP_LOGI(TAG, "ENV: T=%s%d.%02d C, RH=%u.%02u %%, P=%u.%02u hPa",
@@ -138,6 +170,9 @@ static void on_env_message(const LinkMessage *msg, void *ctx)
 	Bridge_OnEnv(&e);
 }
 
+/*
+*	Callback: STM32 health information (uptime, memory, which devices work).
+*/
 static void on_status_message(const LinkMessage *msg, void *ctx)
 {
 	(void)ctx;
@@ -159,6 +194,9 @@ static void on_status_message(const LinkMessage *msg, void *ctx)
 	Bridge_OnStmStatus(&s);
 }
 
+/*
+*	Small helper: subscribe and log an error if it fails.
+*/
 static void subscribe(uint16_t id, void (*cb)(const LinkMessage *msg, void *ctx))
 {
 	if (Link_Subscribe(&g_link, id, cb, NULL) != LINK_OK)
@@ -167,10 +205,14 @@ static void subscribe(uint16_t id, void (*cb)(const LinkMessage *msg, void *ctx)
 	}
 }
 
+/*
+*	Program start on ESP32.
+*/
 void app_main(void)
 {
   ESP_LOGI(TAG, "Initializing Link module...");
 
+	// UART1 with pins 4 (TX) and 5 (RX), speed 115200. Must match the STM32 UART settings.
   const LinkConfig link_cfg = {
     .uart_num = UART_NUM_1,
     .tx_pin = 4,
@@ -196,8 +238,10 @@ void app_main(void)
 
   ESP_LOGI(TAG, "Link module initialized successfully.");
 
+	// Start Wi-Fi, MQTT and the bridge task.
   Bridge_Init(&g_link);
 
+	// Subscribe to all button message ids (from the first to the last one).
   for (uint16_t id = (uint16_t)PROTO_MSG_ID_BUTTON_FIRST; id <= (uint16_t)PROTO_MSG_ID_BUTTON_LAST; id++)
   {
     subscribe(id, on_button_message);
@@ -209,6 +253,7 @@ void app_main(void)
 
   ESP_LOGI(TAG, "Waiting for events...");
 
+	// Nothing to do here. All work is done by tasks and callbacks.
   while (1)
   {
     vTaskDelay(pdMS_TO_TICKS(1000));

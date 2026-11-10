@@ -1,3 +1,9 @@
+/*
+*	Driver for the DS1307 real-time clock chip (I2C).
+*	One task reads the time often, and calls the callback when the time changes.
+*	Setting the time is done by the same task through a queue.
+*/
+
 #include "ds1307.h"
 #include "FreeRTOS.h"
 #include "task.h"
@@ -12,6 +18,9 @@
 #define DS1307_LOCK_TIMEOUT_MS         200U
 #define DS1307_SET_QUEUE_LENGTH        2U
 
+/*
+*	Internal state of the driver.
+*/
 typedef struct
 {
 	DS1307 rtc;
@@ -23,12 +32,21 @@ typedef struct
 	volatile SupervisorTaskID supervisor_id;
 } DS1307_Runtime;
 
+/*
+*	Only ONE clock chip is supported.
+*/
 static DS1307_Runtime s_rt;
 static DS1307_EventCallback s_event_cb;
 static void *s_event_ctx;
 
+/*
+*	Weekday names. Index 1 = Sunday ... 7 = Saturday. Index 0 means "unknown".
+*/
 static const char *const WEEKDAY[8] = { "---", "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
 
+/*
+*	The chip stores numbers in BCD. Example: 0x45 means 45 (each hex digit is a decimal digit).
+*/
 static uint8_t bcd_to_dec(uint8_t bcd)
 {
 	return (uint8_t)(((bcd >> 4) * 10U) + (bcd & 0x0FU));
@@ -39,11 +57,17 @@ static uint8_t dec_to_bcd(uint8_t dec)
 	return (uint8_t)(((dec / 10U) << 4) | (dec % 10U));
 }
 
+/*
+*	Check that both digits are 0..9.
+*/
 static bool bcd_valid(uint8_t bcd)
 {
 	return ((bcd >> 4) <= 9U) && ((bcd & 0x0FU) <= 9U);
 }
 
+/*
+*	Leap year rule: divisible by 4, but not by 100, unless divisible by 400.
+*/
 static bool is_leap(uint16_t y)
 {
 	return ((y % 4U) == 0U && (y % 100U) != 0U) || ((y % 400U) == 0U);
@@ -61,6 +85,9 @@ static uint8_t days_in_month(uint16_t year, uint8_t month)
 	return days[month - 1U];
 }
 
+/*
+*	Check that a date and time make sense (year 2000..2099, real day for the month, etc.).
+*/
 static bool time_valid(const ProtoRtcTime *t)
 {
 	return t->year >= 2000U && t->year <= 2099U
@@ -69,6 +96,9 @@ static bool time_valid(const ProtoRtcTime *t)
 		&& t->hours <= 23U && t->minutes <= 59U && t->seconds <= 59U;
 }
 
+/*
+*	Calculate the weekday from the date (a known short formula). Result: 1 = Sunday ... 7 = Saturday.
+*/
 static uint8_t weekday_from_date(uint16_t year, uint8_t month, uint8_t date)
 {
 	static const uint8_t t[12] = { 0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4 };
@@ -98,11 +128,15 @@ void DS1307_SetEventCallback(DS1307_EventCallback callback, void *ctx)
 	s_event_ctx = ctx;
 }
 
+/*
+*	Read 7 bytes from the chip (seconds ... year) and convert them. Returns false if it fails.
+*/
 static bool read_time(const DS1307_Config *cfg, ProtoRtcTime *out, bool *halted)
 {
 	uint8_t raw[7];
 	HAL_StatusTypeDef status;
 
+	// Take the I2C lock first, because the OLED uses the same bus.
 	if (!I2C_Bus_Lock(pdMS_TO_TICKS(DS1307_LOCK_TIMEOUT_MS)))
 	{
 		return false;
@@ -116,17 +150,20 @@ static bool read_time(const DS1307_Config *cfg, ProtoRtcTime *out, bool *halted)
 		return false;
 	}
 
+	// Bit CH (clock halt) = 1 means the clock oscillator is stopped.
 	*halted = (raw[0] & DS1307_CH_BIT) != 0U;
 
 	const uint8_t sec = (uint8_t)(raw[0] & 0x7FU);
 	const uint8_t min = raw[1];
 	uint8_t hrs = raw[2];
 
+	// Bad BCD digits mean bad data. Ignore this reading.
 	if (!bcd_valid(sec) || !bcd_valid(min) || !bcd_valid(raw[4]) || !bcd_valid(raw[5]) || !bcd_valid(raw[6]))
 	{
 		return false;
 	}
 
+	// The chip can use 12h or 24h mode. We always convert to 24h.
 	if ((hrs & DS1307_HOURS_12H_BIT) != 0U)
 	{
 		const bool pm = (hrs & DS1307_HOURS_PM_BIT) != 0U;
@@ -151,11 +188,15 @@ static bool read_time(const DS1307_Config *cfg, ProtoRtcTime *out, bool *halted)
 	out->month = bcd_to_dec(raw[5]);
 	out->year = (uint16_t)(2000U + bcd_to_dec(raw[6]));
 
+	// Last check: all values must be in a normal range.
 	return out->month >= 1U && out->month <= 12U && out->date >= 1U && out->date <= 31U
 		&& out->hours <= 23U && out->minutes <= 59U && out->seconds <= 59U
 		&& out->weekday >= 1U && out->weekday <= 7U;
 }
 
+/*
+*	Write all 7 time registers at once.
+*/
 static bool write_time(const DS1307_Config *cfg, const ProtoRtcTime *t)
 {
 	const uint8_t raw[7] = {
@@ -180,6 +221,9 @@ static bool write_time(const DS1307_Config *cfg, const ProtoRtcTime *t)
 	return status == HAL_OK;
 }
 
+/*
+*	If the clock is halted (CH bit = 1), clear the bit to start it.
+*/
 static void start_oscillator(const DS1307_Config *cfg)
 {
 	uint8_t sec = 0U;
@@ -199,6 +243,9 @@ static void start_oscillator(const DS1307_Config *cfg)
 	I2C_Bus_Unlock();
 }
 
+/*
+*	Main loop: read time -> send an event if it changed -> check in -> wait for a "set time" command.
+*/
 static void ds1307_task(void *arg)
 {
 	DS1307_Runtime *rt = (DS1307_Runtime *)arg;
@@ -210,6 +257,7 @@ static void ds1307_task(void *arg)
 		poll_ticks = 1U;
 	}
 
+	// Send the first time (and the time after a set) even if it did not change.
 	bool force_emit = true;
 
 	for (;;)
@@ -226,6 +274,7 @@ static void ds1307_task(void *arg)
 				start_oscillator(cfg);
 			}
 
+			// Send an event only when the time is different from the last one.
 			if (force_emit || !rt->has_last || memcmp(&now, &rt->last, sizeof(now)) != 0)
 			{
 				taskENTER_CRITICAL();
@@ -239,6 +288,7 @@ static void ds1307_task(void *arg)
 		}
 		else
 		{
+			// Read failed: the chip is offline.
 			rt->online = false;
 		}
 
@@ -249,6 +299,7 @@ static void ds1307_task(void *arg)
 
 		ProtoRtcTime req;
 
+		// This is the sleep AND the command check: wait for a "set time" request until the poll time ends.
 		if (xQueueReceive(rt->set_queue, &req, poll_ticks) == pdPASS)
 		{
 			(void)write_time(cfg, &req);
@@ -263,6 +314,9 @@ static const DS1307_Ops ds1307_ops = {
 	.is_online = DS1307_IsOnline,
 };
 
+/*
+*	Start the driver: check config, create the queue and the task, register in the supervisor.
+*/
 Result(DS1307, DS1307_Error) DS1307_Init(const DS1307_Config *config)
 {
 	if (config == NULL)
@@ -275,6 +329,7 @@ Result(DS1307, DS1307_Error) DS1307_Init(const DS1307_Config *config)
 		return RESULT_ERROR(DS1307, DS1307_Error, DS1307_ERROR_INVALID_ARG);
 	}
 
+	// Already started? Return the same object.
 	if (s_rt.in_use)
 	{
 		return RESULT_OK(DS1307, DS1307_Error, s_rt.rtc);
@@ -311,6 +366,9 @@ Result(DS1307, DS1307_Error) DS1307_Init(const DS1307_Config *config)
 	return RESULT_OK(DS1307, DS1307_Error, s_rt.rtc);
 }
 
+/*
+*	Get the last known time. Returns false if there is none yet.
+*/
 bool DS1307_GetLast(const DS1307 *self, ProtoRtcTime *out)
 {
 	(void)self;
@@ -327,6 +385,10 @@ bool DS1307_GetLast(const DS1307 *self, ProtoRtcTime *out)
 	return true;
 }
 
+/*
+*	Ask the driver to set a new time. It only checks the data and puts it in a queue.
+*	The task writes it to the chip later.
+*/
 DS1307_Error DS1307_SetTime(const DS1307 *self, const ProtoRtcTime *time)
 {
 	(void)self;
@@ -348,8 +410,10 @@ DS1307_Error DS1307_SetTime(const DS1307 *self, const ProtoRtcTime *time)
 
 	ProtoRtcTime req = *time;
 
+	// We calculate the weekday ourselves. The caller does not need to send it.
 	req.weekday = weekday_from_date(req.year, req.month, req.date);
 
+	// Do not wait: if the queue is full, return an error.
 	if (xQueueSend(s_rt.set_queue, &req, 0) != pdPASS)
 	{
 		return DS1307_ERROR_QUEUE_FULL;
@@ -358,6 +422,9 @@ DS1307_Error DS1307_SetTime(const DS1307 *self, const ProtoRtcTime *time)
 	return DS1307_ERROR_NONE;
 }
 
+/*
+*	Text helpers for the OLED, for example "12:30:05" and "Mon 10.11.2026".
+*/
 void DS1307_TimeFormat(const ProtoRtcTime *time, char *buf, size_t size)
 {
 	(void)snprintf(buf, size, "%02u:%02u:%02u", (unsigned)time->hours, (unsigned)time->minutes, (unsigned)time->seconds);
