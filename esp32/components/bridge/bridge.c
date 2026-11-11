@@ -47,7 +47,8 @@
 *
 *	BASE/rtc/time                {"iso":"2026-11-07T12:00:00","weekday":7}  retained, once for N s
 *
-*	BASE/button/<A|B>/event      {"event","clicks","duration_ms","stm_ts_ms"}
+*	BASE/button/<name>/event     {"event","button_id","name","timestamp_ms","duration_ms","click_count","clicks","stm_ts_ms"}
+*	                             name = A, B ... or "0xNN" for a button that is not in the table in main.c
 *
 *	BASE/button/<A|B>/state      "1" / "0"  retained
 *
@@ -190,8 +191,13 @@ void Bridge_OnButton(uint16_t msg_id, const char *name, const ProtoButtonEvent *
 	char json[JSON_MAX];
 
 	(void)snprintf(suffix, sizeof(suffix), "button/%s/event", name);
-	(void)snprintf(json, sizeof(json), "{\"event\":\"%s\",\"clicks\":%u,\"duration_ms\":%u,\"stm_ts_ms\":%u}",
-		event, (unsigned)ev->click_count, (unsigned)ev->duration_ms, (unsigned)ev->timestamp_ms);
+	// New keys (button_id, name, timestamp_ms, click_count) are for deckd on the PC.
+	// Old keys (clicks, stm_ts_ms) stay, so other MQTT clients do not break.
+	(void)snprintf(json, sizeof(json),
+		"{\"event\":\"%s\",\"button_id\":%u,\"name\":\"%s\",\"timestamp_ms\":%u,\"duration_ms\":%u,\"click_count\":%u,"
+		"\"clicks\":%u,\"stm_ts_ms\":%u}",
+		event, (unsigned)ev->button_id, name, (unsigned)ev->timestamp_ms, (unsigned)ev->duration_ms, (unsigned)ev->click_count,
+		(unsigned)ev->click_count, (unsigned)ev->timestamp_ms);
 	// The event is not retained (it is a one-time event).
 	publish(suffix, json, 1, false);
 
@@ -541,7 +547,6 @@ static void sntp_start_once(void)
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
 	(void)arg;
-	(void)data;
 
 	if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START)
 	{
@@ -549,12 +554,21 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
 	}
 	else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED)
 	{
-		ESP_LOGW(TAG, "WiFi disconnected, reconnecting...");
+		// reason: 2=auth expire, 15=4way handshake timeout, 200=beacon timeout, 201=no AP found,
+		// 202=auth fail, 204=handshake timeout, 205=connection fail. See esp_wifi_types.h.
+		const wifi_event_sta_disconnected_t *d = (const wifi_event_sta_disconnected_t *)data;
+
+		ESP_LOGW(TAG, "WiFi disconnected, reason=%d, reconnecting...", (d != NULL) ? (int)d->reason : -1);
+
+		// Small pause: reconnecting at once can make a loop if the router drops us right away.
+		vTaskDelay(pdMS_TO_TICKS(1000));
 		(void)esp_wifi_connect();
 	}
 	else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP)
 	{
-		ESP_LOGI(TAG, "WiFi got IP");
+		const ip_event_got_ip_t *ip = (const ip_event_got_ip_t *)data;
+
+		ESP_LOGI(TAG, "WiFi got IP " IPSTR, IP2STR(&ip->ip_info.ip));
 		sntp_start_once();
 	}
 }
@@ -600,6 +614,9 @@ static void wifi_start(void)
 	ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
 	ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
 	ESP_ERROR_CHECK(esp_wifi_start());
+
+	// Power save can make some routers drop the connection. We do not need low power here.
+	(void)esp_wifi_set_ps(WIFI_PS_NONE);
 }
 
 /*

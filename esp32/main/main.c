@@ -62,9 +62,32 @@ static ButtonSlot *find_slot(uint8_t id)
 	return NULL;
 }
 
+/*
+*	Print the state of all known buttons in one line, for example "A=1 B=0".
+*	Works for any number of slots in s_buttons.
+*/
 static void log_state(void)
 {
-	ESP_LOGI(TAG, "A=%d B=%d", s_buttons[0].pressed ? 1 : 0, s_buttons[1].pressed ? 1 : 0);
+	char line[96];
+	size_t pos = 0U;
+
+	line[0] = '\0';
+
+	for (size_t i = 0; i < BUTTON_SLOTS; i++)
+	{
+		const int n = snprintf(&line[pos], sizeof(line) - pos, "%s%s=%d",
+			(i == 0U) ? "" : " ", s_buttons[i].name, s_buttons[i].pressed ? 1 : 0);
+
+		// Stop if the line is full (the rest is cut, this is only a log).
+		if (n < 0 || (size_t)n >= (sizeof(line) - pos))
+		{
+			break;
+		}
+
+		pos += (size_t)n;
+	}
+
+	ESP_LOGI(TAG, "%s", line);
 }
 
 /*
@@ -85,40 +108,61 @@ static void on_button_message(const LinkMessage *msg, void *ctx)
 
 	ButtonSlot *slot = find_slot(ev.button_id);
 
-	if (slot == NULL)
+	// Known button: use its name. Unknown button: name is "0xNN", and we still forward the event to the PC.
+	// The PC needs this to "learn" a button that this firmware does not know yet.
+	char name_buf[8];
+	const char *name;
+
+	if (slot != NULL)
 	{
-		ESP_LOGW(TAG, "Unknown button id 0x%02x", (unsigned)ev.button_id);
-		return;
+		name = slot->name;
+	}
+	else
+	{
+		(void)snprintf(name_buf, sizeof(name_buf), "0x%02X", (unsigned)ev.button_id);
+		name = name_buf;
+
+		// One warning per physical press is enough (not for release, clicks, long press).
+		if (msg->id == MSG_ID_BUTTON_PRESSED)
+		{
+			ESP_LOGW(TAG, "Unknown button id %s, forwarding without local state", name);
+		}
 	}
 
-	// The message id tells which event it is.
+	// The message id tells which event it is. The local state is kept only for known buttons.
 	switch (msg->id)
 	{
 	case MSG_ID_BUTTON_PRESSED:
-		slot->pressed = true;
-		ESP_LOGI(TAG, "Button %s: 1 (t=%u ms)", slot->name, (unsigned)ev.timestamp_ms);
-		log_state();
+		ESP_LOGI(TAG, "Button %s: 1 (t=%u ms)", name, (unsigned)ev.timestamp_ms);
+		if (slot != NULL)
+		{
+			slot->pressed = true;
+			log_state();
+		}
 		break;
 
 	case MSG_ID_BUTTON_RELEASED:
-		slot->pressed = false;
-		ESP_LOGI(TAG, "Button %s: 0 (held %u ms)", slot->name, (unsigned)ev.duration_ms);
-		log_state();
+		ESP_LOGI(TAG, "Button %s: 0 (held %u ms)", name, (unsigned)ev.duration_ms);
+		if (slot != NULL)
+		{
+			slot->pressed = false;
+			log_state();
+		}
 		break;
 
 	case MSG_ID_BUTTON_CLICKS:
-		ESP_LOGI(TAG, "Button %s: %u click(s)", slot->name, (unsigned)ev.click_count);
+		ESP_LOGI(TAG, "Button %s: %u click(s)", name, (unsigned)ev.click_count);
 		break;
 
 	case MSG_ID_BUTTON_LONG_PRESS:
-		ESP_LOGI(TAG, "Button %s: long press", slot->name);
+		ESP_LOGI(TAG, "Button %s: long press", name);
 		break;
 
 	default:
 		break;
 	}
 
-	Bridge_OnButton(msg->id, slot->name, &ev);
+	Bridge_OnButton(msg->id, name, &ev);
 }
 
 /*
