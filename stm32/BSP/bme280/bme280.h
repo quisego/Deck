@@ -19,6 +19,8 @@ typedef struct BME280_Config BME280_Config;
 typedef struct BME280_Ops BME280_Ops;
 typedef enum BME280_Error BME280_Error;
 
+typedef void (*BME280_OfflineCallback)(void *ctx);
+
 enum BME280_Error
 {
 	BME280_ERROR_NONE = 0,
@@ -67,6 +69,8 @@ void BME280_FormatHumidity(const ProtoEnvData *data, char *buf, size_t size);
 void BME280_FormatPressure(const ProtoEnvData *data, char *buf, size_t size);
 
 bool BME280_IsOnline(const BME280 *self);
+
+void BME280_SetOfflineCallback(BME280_OfflineCallback callback, void *ctx);
 
 #ifdef __cplusplus
 }

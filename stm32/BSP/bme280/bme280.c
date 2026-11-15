@@ -10,12 +10,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "logger.h"
 
 #define BME280_TASK_STACK_WORDS   512U
 #define BME280_SPI_TIMEOUT_MS     100U
 #define BME280_CHIP_ID            0x60U
 #define BME280_MEASURE_DELAY_MS   12U
 #define BME280_MAX_FAILURES       3U
+#define BME280_HEALTH_CHECK_MS    2000U
 
 /*
 *	Calibration numbers. Every chip has its own numbers stored inside.
@@ -47,6 +49,7 @@ typedef struct
 	volatile bool has_last;
 	bool calibrated;
 	uint8_t failures;
+	TickType_t last_health_tick;
 
 	volatile bool in_use;
 	volatile SupervisorTaskID supervisor_id;
@@ -58,6 +61,8 @@ typedef struct
 static BME280_Runtime s_rt;
 static BME280_EventCallback s_event_cb;
 static void *s_event_ctx;
+static BME280_OfflineCallback s_offline_cb;
+static void *s_offline_ctx;
 
 /*
 *	CS = chip select. LOW means "talk to this chip". HIGH means "chip is free".
@@ -113,6 +118,72 @@ static HAL_StatusTypeDef write_reg(const BME280_Config *c, uint8_t reg, uint8_t 
 	cs_high(c);
 
 	return status;
+}
+
+/*
+*	True if the chip answers with the right ID. We try twice to ignore one noisy read.
+*/
+static bool chip_alive(const BME280_Runtime *rt)
+{
+	const BME280_Config *cfg = &rt->sensor.config;
+
+	for (uint8_t attempt = 0U; attempt < 2U; attempt++)
+	{
+		uint8_t id = 0U;
+
+		if ((read_regs(cfg, BME280_REG_ID, &id, 1U) == HAL_OK) && (id == BME280_CHIP_ID))
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
+/*
+*	Sensor is gone: forget the old data, so nobody shows or sends old values.
+*	The task will try sensor_init() again on the next loop.
+*/
+static void go_offline(BME280_Runtime *rt)
+{
+	rt->calibrated = false;
+	rt->failures = 0U;
+
+	taskENTER_CRITICAL();
+	rt->has_last = false;
+	taskEXIT_CRITICAL();
+
+	LOG_W("BME280: sensor not responding, marked offline");
+
+	if (s_offline_cb != NULL)
+	{
+		s_offline_cb(s_offline_ctx);
+	}
+}
+
+/*
+*	Simple sanity check of the raw bytes and the final values (datasheet ranges).
+*/
+static bool raw_looks_valid(const uint8_t *raw)
+{
+	bool all_ff = true;
+	bool all_00 = true;
+
+	for (uint8_t i = 0U; i < 8U; i++)
+	{
+		all_ff = all_ff && (raw[i] == 0xFFU);
+		all_00 = all_00 && (raw[i] == 0x00U);
+	}
+
+	// A floating or pulled MISO line gives all 0xFF or all 0x00.
+	return !all_ff && !all_00;
+}
+
+static bool values_look_valid(const ProtoEnvData *v)
+{
+	return (v->temperature_c_x100 >= -4000) && (v->temperature_c_x100 <= 8500)
+		&& (v->humidity_pct_x100 <= 10000U)
+		&& (v->pressure_pa >= 30000U) && (v->pressure_pa <= 110000U);
 }
 
 static uint16_t u16_le(const uint8_t *b)
@@ -248,6 +319,8 @@ static bool sensor_init(BME280_Runtime *rt)
 	c->dig_H5 = (int16_t)(((int32_t)(int8_t)buf_h[5] * 16) | (int32_t)(buf_h[4] >> 4));
 	c->dig_H6 = (int8_t)buf_h[6];
 
+	rt->last_health_tick = xTaskGetTickCount();
+
 	return true;
 }
 
@@ -268,7 +341,7 @@ static bool measure(BME280_Runtime *rt, ProtoEnvData *out)
 	// Wait until the measurement is done.
 	vTaskDelay(pdMS_TO_TICKS(BME280_MEASURE_DELAY_MS));
 
-	if (read_regs(cfg, 0xF7, raw, sizeof(raw)) != HAL_OK)
+	if (read_regs(cfg, 0xF7, raw, sizeof(raw)) != HAL_OK || !raw_looks_valid(raw))
 	{
 		return false;
 	}
@@ -282,7 +355,7 @@ static bool measure(BME280_Runtime *rt, ProtoEnvData *out)
 	out->pressure_pa = compensate_pressure(rt, adc_p);
 	out->humidity_pct_x100 = compensate_humidity(rt, adc_h);
 
-	return true;
+	return values_look_valid(out);
 }
 
 /*
@@ -305,6 +378,12 @@ void BME280_SetEventCallback(BME280_EventCallback callback, void *ctx)
 	s_event_ctx = ctx;
 }
 
+void BME280_SetOfflineCallback(BME280_OfflineCallback callback, void *ctx)
+{
+	s_offline_cb = callback;
+	s_offline_ctx = ctx;
+}
+
 /*
 *	Main loop: init if needed -> measure -> send if changed -> check in -> sleep.
 */
@@ -325,6 +404,22 @@ static void bme280_task(void *arg)
 		if (!rt->calibrated)
 		{
 			rt->calibrated = sensor_init(rt);
+		}
+
+				// Every few seconds: is the chip still there?
+		if (rt->calibrated)
+		{
+			const TickType_t tick = xTaskGetTickCount();
+
+			if ((TickType_t)(tick - rt->last_health_tick) >= pdMS_TO_TICKS(BME280_HEALTH_CHECK_MS))
+			{
+				rt->last_health_tick = tick;
+
+				if (!chip_alive(rt))
+				{
+					go_offline(rt);
+				}
+			}
 		}
 
 		if (rt->calibrated)
@@ -353,8 +448,7 @@ static void bme280_task(void *arg)
 			// After several failed measurements in a row, mark the sensor as "not ready" and init it again.
 			else if (++rt->failures >= BME280_MAX_FAILURES)
 			{
-				rt->calibrated = false;
-				rt->failures = 0U;
+				go_offline(rt);
 			}
 		}
 

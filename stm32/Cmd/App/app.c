@@ -224,6 +224,19 @@ static void on_env_event(uint16_t message_id, const ProtoEnvData *data, void *ct
 		LOG_W("ENV message dropped.");
 	}
 }
+
+/*
+*	Called when the sensor stops answering. Show "--" on the OLED instead of old values.
+*/
+static void on_env_offline(void *ctx)
+{
+	(void)ctx;
+
+	(void)SSD1306_SetLine(&g_oled, SSD1306_LINE_TEMPERATURE, "T: --.- C");
+	(void)SSD1306_SetLine(&g_oled, SSD1306_LINE_HUMIDITY, "RH: -- %");
+	(void)SSD1306_SetLine(&g_oled, SSD1306_LINE_PRESSURE, "P: ---- hPa");
+}
+
 /*
 *	Status task: every 5 seconds we send "I am alive" information to the ESP32.
 */
@@ -315,7 +328,7 @@ static void app_sensors_init(const AppConfig *cfg)
 	}
 
 	BME280_SetEventCallback(on_env_event, NULL);
-
+	BME280_SetOfflineCallback(on_env_offline, NULL);
 	// The BME280 sensor uses SPI. Pin PA4 is the chip select (CS).
 	const BME280_Config bme_cfg = {
 		.hspi = cfg->spi_h,
